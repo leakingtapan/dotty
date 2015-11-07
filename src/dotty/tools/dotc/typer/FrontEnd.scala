@@ -9,6 +9,7 @@ import parsing.Parsers.Parser
 import config.Printers._
 import util.Stats._
 import scala.util.control.NonFatal
+import util.FreshNameCreator
 
 class FrontEnd extends Phase {
 
@@ -28,7 +29,8 @@ class FrontEnd extends Phase {
     unit.untpdTree =
       if (unit.isJava) new JavaParser(unit.source).parse()
       else new Parser(unit.source).parse()
-    typr.println("parsed:\n" + unit.untpdTree.show)
+    val printer = if (ctx.settings.Xprint.value.contains("parser")) default else typr
+    printer.println("parsed:\n" + unit.untpdTree.show)
   }
 
   def enterSyms(implicit ctx: Context) = monitor("indexing") {
@@ -46,7 +48,8 @@ class FrontEnd extends Phase {
   }
 
   override def runOn(units: List[CompilationUnit])(implicit ctx: Context): List[CompilationUnit] = {
-    val unitContexts = units map (unit => ctx.fresh.setCompilationUnit(unit))
+    val unitContexts = for (unit <- units) yield
+      ctx.fresh.setCompilationUnit(unit).setFreshNames(new FreshNameCreator.Default)
     unitContexts foreach (parse(_))
     record("parsedTrees", ast.Trees.ntrees)
     unitContexts foreach (enterSyms(_))

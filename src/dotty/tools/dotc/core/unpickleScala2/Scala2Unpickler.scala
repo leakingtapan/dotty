@@ -130,8 +130,18 @@ object Scala2Unpickler {
     } else {
       registerCompanionPair(scalacCompanion, denot.classSymbol)
     }
+    val declsTypeParams = denot.typeParams
+    val declsInRightOrder =
+      if (declsTypeParams.corresponds(tparams)(_.name == _.name)) decls
+      else { // create new scope with type parameters in right order
+        val decls1 = newScope
+        for (tparam <- tparams) decls1.enter(decls.lookup(tparam.name))
+        for (sym <- decls) if (!declsTypeParams.contains(sym)) decls1.enter(sym)
+        decls1
+      }
 
-    denot.info = ClassInfo(denot.owner.thisType, denot.classSymbol, parentRefs, decls, ost)
+    denot.info = ClassInfo(
+      denot.owner.thisType, denot.classSymbol, parentRefs, declsInRightOrder, ost)
   }
 }
 
@@ -451,6 +461,7 @@ class Scala2Unpickler(bytes: Array[Byte], classRoot: ClassDenotation, moduleClas
     }
 
     def finishSym(sym: Symbol): Symbol = {
+      if (sym.isClass) sym.setFlag(Scala2x)
       val owner = sym.owner
       if (owner.isClass &&
           !(  isUnpickleRoot(sym)
@@ -536,7 +547,6 @@ class Scala2Unpickler(bytes: Array[Byte], classRoot: ClassDenotation, moduleClas
           case denot: ClassDenotation =>
             val selfInfo = if (atEnd) NoType else readTypeRef()
             setClassInfo(denot, tp, selfInfo)
-            denot setFlag Scala2x
           case denot =>
             val tp1 = depoly(tp, denot)
             denot.info =
@@ -621,7 +631,7 @@ class Scala2Unpickler(bytes: Array[Byte], classRoot: ClassDenotation, moduleClas
             tp.derivedRefinedType(parent1, name, info)
         }
       case tp @ TypeRef(pre, tpnme.hkApply) =>
-        elim(pre)
+        tp.derivedSelect(elim(pre))
       case _ =>
         tp
     }
@@ -687,7 +697,10 @@ class Scala2Unpickler(bytes: Array[Byte], classRoot: ClassDenotation, moduleClas
           case _ =>
         }
         val tycon =
-          if (isLocal(sym) || pre == NoPrefix) {
+          if (sym.isClass && sym.is(Scala2x) && !sym.owner.is(Package))
+            // used fixed sym for Scala 2 inner classes, because they might be shadowed
+            TypeRef.withFixedSym(pre, sym.name.asTypeName, sym.asType)
+          else if (isLocal(sym) || pre == NoPrefix) {
             val pre1 = if ((pre eq NoPrefix) && (sym is TypeParam)) sym.owner.thisType else pre
             pre1 select sym
           }

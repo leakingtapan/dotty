@@ -200,7 +200,7 @@ class Typer extends Namer with TypeAssigner with Applications with Implicits wit
        */
       def isDefinedInCurrentUnit(denot: Denotation): Boolean = denot match {
         case MultiDenotation(d1, d2) => isDefinedInCurrentUnit(d1) || isDefinedInCurrentUnit(d2)
-        case denot: SingleDenotation => denot.symbol.sourceFile == ctx.source
+        case denot: SingleDenotation => denot.symbol.sourceFile == ctx.source.file
       }
 
       /** Is `denot` the denotation of a self symbol? */
@@ -502,6 +502,16 @@ class Typer extends Namer with TypeAssigner with Applications with Implicits wit
     assignType(cpy.If(tree)(cond1, thenp2, elsep2), thenp2, elsep2)
   }
 
+  private def decomposeProtoFunction(pt: Type, defaultArity: Int)(implicit ctx: Context): (List[Type], Type) = pt match {
+    case _ if defn.isFunctionType(pt) =>
+      (pt.dealias.argInfos.init, pt.dealias.argInfos.last)
+    case SAMType(meth) =>
+      val mt @ MethodType(_, paramTypes) = meth.info
+      (paramTypes, mt.resultType)
+    case _ =>
+      (List.range(0, defaultArity) map alwaysWildcardType, WildcardType)
+  }
+
   def typedFunction(tree: untpd.Function, pt: Type)(implicit ctx: Context) = track("typedFunction") {
     val untpd.Function(args, body) = tree
     if (ctx.mode is Mode.Type)
@@ -509,15 +519,7 @@ class Typer extends Namer with TypeAssigner with Applications with Implicits wit
         untpd.TypeTree(defn.FunctionClass(args.length).typeRef), args :+ body), pt)
     else {
       val params = args.asInstanceOf[List[untpd.ValDef]]
-      val (protoFormals, protoResult): (List[Type], Type) = pt match {
-        case _ if defn.isFunctionType(pt) =>
-          (pt.dealias.argInfos.init, pt.dealias.argInfos.last)
-        case SAMType(meth) =>
-          val mt @ MethodType(_, paramTypes) = meth.info
-          (paramTypes, mt.resultType)
-        case _ =>
-          (params map alwaysWildcardType, WildcardType)
-      }
+      val (protoFormals, protoResult) = decomposeProtoFunction(pt, params.length)
 
       def refersTo(arg: untpd.Tree, param: untpd.ValDef): Boolean = arg match {
         case Ident(name) => name == param.name
@@ -563,7 +565,7 @@ class Typer extends Namer with TypeAssigner with Applications with Implicits wit
             val pos = params indexWhere (_.name == param.name)
             if (pos < mtpe.paramTypes.length) {
               val ptype = mtpe.paramTypes(pos)
-              if (isFullyDefined(ptype, ForceDegree.none)) return ptype
+              if (isFullyDefined(ptype, ForceDegree.noBottom)) return ptype
             }
           case _ =>
         }
@@ -629,7 +631,8 @@ class Typer extends Namer with TypeAssigner with Applications with Implicits wit
   def typedMatch(tree: untpd.Match, pt: Type)(implicit ctx: Context) = track("typedMatch") {
     tree.selector match {
       case EmptyTree =>
-        typed(desugar.makeCaseLambda(tree.cases) withPos tree.pos, pt)
+        val (protoFormals, _) = decomposeProtoFunction(pt, 1)
+        typed(desugar.makeCaseLambda(tree.cases, protoFormals.length) withPos tree.pos, pt)
       case _ =>
         val sel1 = typedExpr(tree.selector)
         val selType = widenForMatchSelector(
@@ -848,34 +851,7 @@ class Typer extends Namer with TypeAssigner with Applications with Implicits wit
       }
       val args1 = args.zipWithConserve(tparams)(typedArg(_, _)).asInstanceOf[List[Tree]]
       // check that arguments conform to bounds is done in phase PostTyper
-      val tree1 = assignType(cpy.AppliedTypeTree(tree)(tpt1, args1), tpt1, args1)
-      if (tree1.tpe.isHKApply)
-        for (arg @ TypeBoundsTree(_, _) <- args1)
-          ctx.error("illegal wildcard type argument; does not correspond to type parameter of a class", arg.pos)
-          // The reason for outlawing such arguments is illustrated by the following example.
-          // Say we have
-          //
-          //    type RMap[A, B] = Map[B, A]
-          //
-          // Then
-          //
-          //    Rmap[_, Int]
-          //
-          // translates to
-          //
-          //    Lambda$I { type hk$0; type hk$1 = Int; type $apply = Map[$hk1, $hk0] } # $apply
-          //
-          // Let's call the last type T. You would expect that
-          //
-          //    Map[Int, String] <: RMap[_, Int]
-          //
-          // But that's not the case given the standard subtyping rules. In fact, the rhs reduces to
-          //
-          //    Map[Int, T # $hk0]
-          //
-          // That means the second argument to `Map` is unknown and String is certainly not a subtype of it.
-          // To avoid the surprise we outlaw problematic wildcard arguments from the start.
-      tree1
+      assignType(cpy.AppliedTypeTree(tree)(tpt1, args1), tpt1, args1)
     }
   }
 
@@ -1027,7 +1003,7 @@ class Typer extends Namer with TypeAssigner with Applications with Implicits wit
    */
   def ensureConstrCall(cls: ClassSymbol, parents: List[Tree])(implicit ctx: Context): List[Tree] = {
     val firstParent :: otherParents = parents
-    if (firstParent.isType && !(cls is Trait))
+    if (firstParent.isType && !(cls is Trait) && !cls.is(JavaDefined))
       typed(untpd.New(untpd.TypedSplice(firstParent), Nil)) :: otherParents
     else parents
   }
@@ -1265,7 +1241,8 @@ class Typer extends Namer with TypeAssigner with Applications with Implicits wit
 
   def adapt(tree: Tree, pt: Type, original: untpd.Tree = untpd.EmptyTree)(implicit ctx: Context) = /*>|>*/ track("adapt") /*<|<*/ {
     /*>|>*/ ctx.traceIndented(i"adapting $tree of type ${tree.tpe} to $pt", typr, show = true) /*<|<*/ {
-      interpolateUndetVars(tree, if (tree.isDef) tree.symbol else NoSymbol)
+      if (tree.isDef) interpolateUndetVars(tree, tree.symbol)
+      else if (!tree.tpe.widen.isInstanceOf[MethodOrPoly]) interpolateUndetVars(tree, NoSymbol)
       tree.overwriteType(tree.tpe.simplified)
       adaptInterpolated(tree, pt, original)
     }
