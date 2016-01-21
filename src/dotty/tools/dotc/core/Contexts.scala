@@ -72,10 +72,22 @@ object Contexts {
       def next = { val c = current; current = current.outer; c }
     }
 
+    /** Set the compiler callback, shared by all contexts with the same `base` */
+    def setCompilerCallback(callback: CompilerCallback): this.type = {
+      base.compilerCallback = callback; this
+    }
+
     /** The outer context */
     private[this] var _outer: Context = _
     protected def outer_=(outer: Context) = _outer = outer
     def outer: Context = _outer
+
+    // protected def compilerCallback_=(callback: CompilerCallback) =
+    //   _compilerCallback = callback
+    // def compilerCallback: CompilerCallback = _compilerCallback
+    // def setCompilerCallback(callback: CompilerCallback): this.type = {
+    //   this.compilerCallback = callback; this
+    // }
 
     /** The current context */
     private[this] var _period: Period = _
@@ -525,6 +537,9 @@ object Contexts {
   /** The essential mutable state of a context base, collected into a common class */
   class ContextState {
 
+    /** The compiler callback implementation, or null if unset */
+    var compilerCallback: CompilerCallback = _
+
     // Symbols state
 
     /** A counter for unique ids */
@@ -585,10 +600,16 @@ object Contexts {
      *  of underlying during a controlled operation exists. */
     private[core] val pendingUnderlying = new mutable.HashSet[Type]
 
+    /** A flag that some unsafe nonvariant instantiation was encountered
+     *  in this run. Used as a shortcut to a avoid scans of types in
+     *  Typer.typedSelect.
+     */
+    private[dotty] var unsafeNonvariant: RunId = NoRunId
+
+    // Phases state
 
     private[core] var phasesPlan: List[List[Phase]] = _
 
-    // Phases state
     /** Phases by id */
     private[core] var phases: Array[Phase] = _
 

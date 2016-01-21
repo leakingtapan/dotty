@@ -2,7 +2,7 @@ package dotty.tools
 package dotc
 package ast
 
-import dotty.tools.dotc.transform.ExplicitOuter
+import dotty.tools.dotc.transform.{ExplicitOuter, Erasure}
 import dotty.tools.dotc.typer.ProtoTypes.FunProtoTyped
 import transform.SymUtils._
 import core._
@@ -13,7 +13,6 @@ import config.Printers._
 import typer.Mode
 import collection.mutable
 import typer.ErrorReporting._
-import transform.Erasure
 
 import scala.annotation.tailrec
 
@@ -268,7 +267,7 @@ object tpd extends Trees.Instance[Type] with TypedTreeInfo {
   def AnonClass(parents: List[Type], fns: List[TermSymbol], methNames: List[TermName])(implicit ctx: Context): Block = {
     val owner = fns.head.owner
     val parents1 =
-      if (parents.head.classSymbol.is(Trait)) defn.ObjectClass.typeRef :: parents
+      if (parents.head.classSymbol.is(Trait)) defn.ObjectType :: parents
       else parents
     val cls = ctx.newNormalizedClassSymbol(owner, tpnme.ANON_FUN, Synthetic, parents1,
         coord = fns.map(_.pos).reduceLeft(_ union _))
@@ -376,7 +375,7 @@ object tpd extends Trees.Instance[Type] with TypedTreeInfo {
       newArr(elemClass.name.toString)
     else
       newArr("Ref").appliedToTypeTrees(
-        TypeTree(defn.ArrayType(elemType)).withPos(typeArg.pos) :: Nil)
+        TypeTree(defn.ArrayOf(elemType)).withPos(typeArg.pos) :: Nil)
   }
 
   // ------ Creating typed equivalents of trees that exist only in untyped form -------
@@ -778,6 +777,27 @@ object tpd extends Trees.Instance[Type] with TypedTreeInfo {
       }
       else Assign(tree, rhs)
 
+    /** A tree in place of this tree that represents the class of type `tp`.
+     *  Contains special handling if the class is a primitive value class
+     *  and invokes a `default` method otherwise.
+     */
+    def clsOf(tp: Type, default: => Tree)(implicit ctx: Context): Tree = {
+      def TYPE(module: TermSymbol) =
+        ref(module).select(nme.TYPE_).ensureConforms(tree.tpe).withPos(tree.pos)
+      defn.scalaClassName(tp) match {
+        case tpnme.Boolean => TYPE(defn.BoxedBooleanModule)
+        case tpnme.Byte => TYPE(defn.BoxedByteModule)
+        case tpnme.Short => TYPE(defn.BoxedShortModule)
+        case tpnme.Char => TYPE(defn.BoxedCharModule)
+        case tpnme.Int => TYPE(defn.BoxedIntModule)
+        case tpnme.Long => TYPE(defn.BoxedLongModule)
+        case tpnme.Float => TYPE(defn.BoxedFloatModule)
+        case tpnme.Double => TYPE(defn.BoxedDoubleModule)
+        case tpnme.Unit => TYPE(defn.BoxedUnitModule)
+        case _ => default
+      }
+    }
+
     // --- Higher order traversal methods -------------------------------
 
     /** Apply `f` to each subtree of this tree */
@@ -825,15 +845,22 @@ object tpd extends Trees.Instance[Type] with TypedTreeInfo {
   def applyOverloaded(receiver: Tree, method: TermName, args: List[Tree], targs: List[Type], expectedType: Type, isAnnotConstructor: Boolean = false)(implicit ctx: Context): Tree = {
     val typer = ctx.typer
     val proto = new FunProtoTyped(args, expectedType, typer)
-    val alts = receiver.tpe.member(method).alternatives.map(_.termRef)
-
-    val alternatives = ctx.typer.resolveOverloaded(alts, proto, Nil)
-    assert(alternatives.size == 1,
-      i"multiple overloads available for $method on ${receiver.tpe.widenDealias} with targs: $targs, args: $args and expectedType: $expectedType." +
-        i" isAnnotConstructor = $isAnnotConstructor.\n" +
-        i"alternatives: $alternatives") // this is parsed from bytecode tree. there's nothing user can do about it
-
-    val selected = alternatives.head
+    val denot = receiver.tpe.member(method)
+    assert(denot.exists, i"no member $receiver . $method, members = ${receiver.tpe.decls}")
+    val selected =
+      if (denot.isOverloaded) {
+        val allAlts = denot.alternatives.map(_.termRef)
+        val alternatives =
+          ctx.typer.resolveOverloaded(allAlts, proto, Nil)
+        assert(alternatives.size == 1,
+          i"${if (alternatives.isEmpty) "no" else "multiple"} overloads available for " +
+          i"$method on ${receiver.tpe.widenDealias} with targs: $targs, args: $args and expectedType: $expectedType." +
+          i" isAnnotConstructor = $isAnnotConstructor.\n" +
+          i"all alternatives: ${allAlts.map(_.symbol.showDcl).mkString(", ")}\n" +
+          i"matching alternatives: ${alternatives.map(_.symbol.showDcl).mkString(", ")}.") // this is parsed from bytecode tree. there's nothing user can do about it
+        alternatives.head
+      }
+      else denot.asSingleDenotation.termRef
     val fun = receiver
       .select(TermRef.withSig(receiver.tpe, selected.termSymbol.asTerm))
       .appliedToTypes(targs)
@@ -843,14 +870,14 @@ object tpd extends Trees.Instance[Type] with TypedTreeInfo {
         val defn = ctx.definitions
         val prefix = args.take(selected.widen.paramTypess.head.size - 1)
         expectedType match {
-          case defn.ArrayType(el) =>
+          case defn.ArrayOf(el) =>
             lastParam.tpe match {
-              case defn.ArrayType(el2) if el2 <:< el =>
+              case defn.ArrayOf(el2) if el2 <:< el =>
                 // we have a JavaSeqLiteral with a more precise type
                 // we cannot construct a tree as JavaSeqLiteral infered to precise type
                 // if we add typed than it would be both type-correct and
                 // will pass Ycheck
-                prefix ::: List(tpd.Typed(lastParam, TypeTree(defn.ArrayType(el))))
+                prefix ::: List(tpd.Typed(lastParam, TypeTree(defn.ArrayOf(el))))
               case _ =>
                 ???
             }

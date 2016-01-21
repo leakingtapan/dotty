@@ -41,6 +41,28 @@ object Checking {
           d"Type argument ${arg.tpe} does not conform to $which bound $bound ${err.whyNoMatchStr(arg.tpe, bound)}",
           arg.pos)
 
+  /** Check that type arguments `args` conform to corresponding bounds in `poly`
+   *  Note: This does not check the bounds of AppliedTypeTrees. These
+   *  are handled by method checkBounds in FirstTransform
+   */
+  def checkBounds(args: List[tpd.Tree], poly: PolyType)(implicit ctx: Context): Unit =
+    checkBounds(args, poly.paramBounds, _.substParams(poly, _))
+
+  /** Check all AppliedTypeTree nodes in this tree for legal bounds */
+  val boundsChecker = new TreeTraverser {
+    def traverse(tree: Tree)(implicit ctx: Context) = {
+      tree match {
+        case AppliedTypeTree(tycon, args) =>
+          val tparams = tycon.tpe.typeSymbol.typeParams
+          val bounds = tparams.map(tparam =>
+            tparam.info.asSeenFrom(tycon.tpe.normalizedPrefix, tparam.owner.owner).bounds)
+          checkBounds(args, bounds, _.substDealias(tparams, _))
+        case _ =>
+      }
+      traverseChildren(tree)
+    }
+  }
+
   /** Check that `tp` refers to a nonAbstract class
    *  and that the instance conforms to the self type of the created class.
    */
@@ -131,9 +153,7 @@ object Checking {
             case SuperType(thistp, _) => isInteresting(thistp)
             case AndType(tp1, tp2) => isInteresting(tp1) || isInteresting(tp2)
             case OrType(tp1, tp2) => isInteresting(tp1) && isInteresting(tp2)
-            case _: RefinedType => false
-              // Note: it's important not to visit parents of RefinedTypes,
-              // since otherwise spurious #Apply projections might be inserted.
+            case _: RefinedType => true
             case _ => false
           }
           // If prefix is interesting, check info of typeref recursively, marking the referred symbol
@@ -141,10 +161,12 @@ object Checking {
           // is hit again. Without this precaution we could stackoverflow here.
           if (isInteresting(pre)) {
             val info = tp.info
-            val symInfo = tp.symbol.info
-            if (tp.symbol.exists) tp.symbol.info = SymDenotations.NoCompleter
+            val sym = tp.symbol
+            if (sym.infoOrCompleter == SymDenotations.NoCompleter) throw CyclicReference(sym)
+            val symInfo = sym.info
+            if (sym.exists) sym.info = SymDenotations.NoCompleter
             try checkInfo(info)
-            finally if (tp.symbol.exists) tp.symbol.info = symInfo
+            finally if (sym.exists) sym.info = symInfo
           }
           tp
         } catch {
@@ -295,13 +317,6 @@ trait Checking {
     tree
   }
 
-  /** Check that type arguments `args` conform to corresponding bounds in `poly`
-   *  Note: This does not check the bounds of AppliedTypeTrees. These
-   *  are handled by method checkBounds in FirstTransform
-   */
-  def checkBounds(args: List[tpd.Tree], poly: PolyType)(implicit ctx: Context): Unit =
-    Checking.checkBounds(args, poly.paramBounds, _.substParams(poly, _))
-
   /** Check that type `tp` is stable. */
   def checkStable(tp: Type, pos: Position)(implicit ctx: Context): Unit =
     if (!tp.isStable && !tp.isErroneous)
@@ -310,7 +325,7 @@ trait Checking {
  /**  Check that `tp` is a class type with a stable prefix. Also, if `traitReq` is
    *  true check that `tp` is a trait.
    *  Stability checking is disabled in phases after RefChecks.
-   *  @return  `tp` itself if it is a class or trait ref, ObjectClass.typeRef if not.
+   *  @return  `tp` itself if it is a class or trait ref, ObjectType if not.
    */
   def checkClassTypeWithStablePrefix(tp: Type, pos: Position, traitReq: Boolean)(implicit ctx: Context): Type =
     tp.underlyingClassRef(refinementOK = false) match {
@@ -320,7 +335,7 @@ trait Checking {
         tp
       case _ =>
         ctx.error(d"$tp is not a class type", pos)
-        defn.ObjectClass.typeRef
+        defn.ObjectType
   }
 
   /** Check that a non-implicit parameter making up the first parameter section of an
@@ -401,13 +416,23 @@ trait Checking {
       errorTree(tpt, d"missing type parameter for ${tpt.tpe}")
     }
     else tpt
+
+  def checkLowerNotHK(sym: Symbol, tparams: List[Symbol], pos: Position)(implicit ctx: Context) =
+    if (tparams.nonEmpty)
+      sym.info match {
+        case info: TypeAlias => // ok
+        case TypeBounds(lo, _) =>
+          for (tparam <- tparams)
+            if (tparam.typeRef.occursIn(lo))
+              ctx.error(i"type parameter ${tparam.name} may not occur in lower bound $lo", pos)
+        case _ =>
+      }
 }
 
 trait NoChecking extends Checking {
   import tpd._
   override def checkNonCyclic(sym: Symbol, info: TypeBounds, reportErrors: Boolean)(implicit ctx: Context): Type = info
   override def checkValue(tree: Tree, proto: Type)(implicit ctx: Context): tree.type = tree
-  override def checkBounds(args: List[tpd.Tree], poly: PolyType)(implicit ctx: Context): Unit = ()
   override def checkStable(tp: Type, pos: Position)(implicit ctx: Context): Unit = ()
   override def checkClassTypeWithStablePrefix(tp: Type, pos: Position, traitReq: Boolean)(implicit ctx: Context): Type = tp
   override def checkImplicitParamsNotSingletons(vparamss: List[List[ValDef]])(implicit ctx: Context): Unit = ()
@@ -415,4 +440,5 @@ trait NoChecking extends Checking {
   override def checkNoDoubleDefs(cls: Symbol)(implicit ctx: Context): Unit = ()
   override def checkParentCall(call: Tree, caller: ClassSymbol)(implicit ctx: Context) = ()
   override def checkSimpleKinded(tpt: Tree)(implicit ctx: Context): Tree = tpt
+  override def checkLowerNotHK(sym: Symbol, tparams: List[Symbol], pos: Position)(implicit ctx: Context) = ()
 }

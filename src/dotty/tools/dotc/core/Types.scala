@@ -33,6 +33,7 @@ import annotation.tailrec
 import Flags.FlagSet
 import typer.Mode
 import language.implicitConversions
+import scala.util.hashing.{ MurmurHash3 => hashing }
 
 object Types {
 
@@ -99,7 +100,7 @@ object Types {
       case _ => false
     }
 
-    /** Is this type a (possibly aliased and/or partially applied) type reference
+    /** Is this type a (possibly refined or applied or aliased) type reference
      *  to the given type symbol?
      *  @sym  The symbol to compare to. It must be a class symbol or abstract type.
      *        It makes no sense for it to be an alias type because isRef would always
@@ -112,8 +113,7 @@ object Types {
           case _ =>  this1.symbol eq sym
         }
       case this1: RefinedType =>
-        // make sure all refinements are type arguments
-        this1.parent.isRef(sym) && this.argInfos.nonEmpty
+        this1.parent.isRef(sym)
       case _ =>
         false
     }
@@ -141,20 +141,23 @@ object Types {
     }
 
     /** Is this type an instance of a non-bottom subclass of the given class `cls`? */
-    final def derivesFrom(cls: Symbol)(implicit ctx: Context): Boolean = this match {
-      case tp: TypeRef =>
-        val sym = tp.symbol
-        if (sym.isClass) sym.derivesFrom(cls) else tp.underlying.derivesFrom(cls)
-      case tp: TypeProxy =>
-        tp.underlying.derivesFrom(cls)
-      case tp: AndType =>
-        tp.tp1.derivesFrom(cls) || tp.tp2.derivesFrom(cls)
-      case tp: OrType =>
-        tp.tp1.derivesFrom(cls) && tp.tp2.derivesFrom(cls)
-      case tp: JavaArrayType =>
-        cls == defn.ObjectClass
-      case _ =>
-        false
+    final def derivesFrom(cls: Symbol)(implicit ctx: Context): Boolean = {
+      def loop(tp: Type) = tp match {
+        case tp: TypeRef =>
+          val sym = tp.symbol
+          if (sym.isClass) sym.derivesFrom(cls) else tp.underlying.derivesFrom(cls)
+        case tp: TypeProxy =>
+          tp.underlying.derivesFrom(cls)
+        case tp: AndType =>
+          tp.tp1.derivesFrom(cls) || tp.tp2.derivesFrom(cls)
+        case tp: OrType =>
+          tp.tp1.derivesFrom(cls) && tp.tp2.derivesFrom(cls)
+        case tp: JavaArrayType =>
+          cls == defn.ObjectClass
+        case _ =>
+          false
+      }
+      cls == defn.AnyClass || loop(this)
     }
 
     /** Is this type guaranteed not to have `null` as a value?
@@ -175,7 +178,7 @@ object Types {
 
     /** Does the type carry an annotation that is an instance of `cls`? */
     final def hasAnnotation(cls: ClassSymbol)(implicit ctx: Context): Boolean = stripTypeVar match {
-      case AnnotatedType(annot, tp) => (annot matches cls) || (tp hasAnnotation cls)
+      case AnnotatedType(tp, annot) => (annot matches cls) || (tp hasAnnotation cls)
       case _ => false
     }
 
@@ -186,6 +189,16 @@ object Types {
     /** Is this a type of a repeated parameter? */
     def isRepeatedParam(implicit ctx: Context): Boolean =
       typeSymbol eq defn.RepeatedParamClass
+
+    /** Does this type carry an UnsafeNonvariant annotation? */
+    final def isUnsafeNonvariant(implicit ctx: Context): Boolean = this match {
+      case AnnotatedType(_, annot) => annot.symbol == defn.UnsafeNonvariantAnnot
+      case _ => false
+    }
+
+    /** Does this type have an UnsafeNonvariant annotation on one of its parts? */
+    final def hasUnsafeNonvariant(implicit ctx: Context): Boolean =
+      new HasUnsafeNonAccumulator().apply(false, this)
 
     /** Is this the type of a method that has a repeated parameter type as
      *  last parameter type?
@@ -446,11 +459,26 @@ object Types {
           val jointInfo =
             if (rinfo.isAlias) rinfo
             else if (pdenot.info.isAlias) pdenot.info
-            else if (ctx.pendingMemberSearches.contains(name)) safeAnd(pdenot.info, rinfo)
-            else pdenot.info & rinfo
+            else if (ctx.pendingMemberSearches.contains(name)) pdenot.info safe_& rinfo
+            else
+              try pdenot.info & rinfo
+              catch {
+                case ex: CyclicReference =>
+                  // happens for tests/pos/sets.scala. findMember is called from baseTypeRef.
+                  // The & causes a subtype check which calls baseTypeRef again with the same
+                  // superclass. In the observed case, the superclass was Any, and
+                  // the special shortcut for Any in derivesFrom was as yet absent. To reproduce,
+                  // remove the special treatment of Any in derivesFrom and compile
+                  // sets.scala.
+                  pdenot.info safe_& rinfo
+              }
           pdenot.asSingleDenotation.derivedSingleDenotation(pdenot.symbol, jointInfo)
-        } else
-          pdenot & (new JointRefDenotation(NoSymbol, rinfo, Period.allInRun(ctx.runId)), pre)
+        } else {
+          pdenot & (
+            new JointRefDenotation(NoSymbol, rinfo, Period.allInRun(ctx.runId)),
+            pre,
+            safeIntersection = ctx.pendingMemberSearches.contains(name))
+        }
       }
       def goThis(tp: ThisType) = {
         val d = go(tp.underlying)
@@ -477,12 +505,10 @@ object Types {
             go(next)
         }
       }
-      def goAnd(l: Type, r: Type) = go(l) & (go(r), pre)
-      def goOr(l: Type, r: Type) = go(l) | (go(r), pre)
-      def safeAnd(tp1: Type, tp2: Type): Type = (tp1, tp2) match {
-        case (TypeBounds(lo1, hi1), TypeBounds(lo2, hi2)) => TypeBounds(lo1 | lo2, AndType(hi1, hi2))
-        case _ => tp1 & tp2
+      def goAnd(l: Type, r: Type) = {
+        go(l) & (go(r), pre, safeIntersection = ctx.pendingMemberSearches.contains(name))
       }
+      def goOr(l: Type, r: Type) = go(l) | (go(r), pre)
 
       { val recCount = ctx.findMemberCount + 1
         ctx.findMemberCount = recCount
@@ -606,10 +632,10 @@ object Types {
     }
 
     /** Is this type a primitive value type which can be widened to the primitive value type `that`? */
-    def isValueSubType(that: Type)(implicit ctx: Context) = widenExpr match {
-      case self: TypeRef if defn.ScalaValueClasses contains self.symbol =>
+    def isValueSubType(that: Type)(implicit ctx: Context) = widen match {
+      case self: TypeRef if self.symbol.isPrimitiveValueClass =>
         that.widenExpr match {
-          case that: TypeRef if defn.ScalaValueClasses contains that.symbol =>
+          case that: TypeRef if that.symbol.isPrimitiveValueClass =>
             defn.isValueSubClass(self.symbol, that.symbol)
           case _ =>
             false
@@ -617,6 +643,9 @@ object Types {
       case _ =>
         false
     }
+
+    def relaxed_<:<(that: Type)(implicit ctx: Context) =
+      (this <:< that) || (this isValueSubType that)
 
     /** Is this type a legal type for a member that overrides another
      *  member of type `that`? This is the same as `<:<`, except that
@@ -676,6 +705,19 @@ object Types {
 
     def & (that: Type)(implicit ctx: Context): Type = track("&") {
       ctx.typeComparer.glb(this, that)
+    }
+
+    /** Safer version of `&`.
+     *
+     *  This version does not simplify the upper bound of the intersection of
+     *  two TypeBounds. The simplification done by `&` requires subtyping checks
+     *  which may end up calling `&` again, in most cases this should be safe
+     *  but because of F-bounded types, this can result in an infinite loop
+     *  (which will be masked unless `-Yno-deep-subtypes` is enabled).
+     */
+    def safe_& (that: Type)(implicit ctx: Context): Type = (this, that) match {
+      case (TypeBounds(lo1, hi1), TypeBounds(lo2, hi2)) => TypeBounds(lo1 | lo2, AndType(hi1, hi2))
+      case _ => this & that
     }
 
     def | (that: Type)(implicit ctx: Context): Type = track("|") {
@@ -738,12 +780,19 @@ object Types {
       case _ => this
     }
 
+    /** If this is a skolem, its underlying type, otherwise the type itself */
+    final def widenSkolem(implicit ctx: Context): Type = this match {
+      case tp: SkolemType => tp.underlying
+      case _ => this
+    }
+
     /** Follow aliases and dereferences LazyRefs and instantiated TypeVars until type
      *  is no longer alias type, LazyRef, or instantiated type variable.
      */
     final def dealias(implicit ctx: Context): Type = this match {
       case tp: TypeRef =>
-        tp.info match {
+        if (tp.symbol.isClass) tp
+        else tp.info match {
           case TypeAlias(tp) => tp.dealias
           case _ => tp
         }
@@ -753,7 +802,7 @@ object Types {
       case tp: LazyRef =>
         tp.ref.dealias
       case tp: AnnotatedType =>
-        tp.derivedAnnotatedType(tp.annot, tp.tpe.dealias)
+        tp.derivedAnnotatedType(tp.tpe.dealias, tp.annot)
       case tp => tp
     }
 
@@ -851,7 +900,7 @@ object Types {
           object instantiate extends TypeMap {
             var isSafe = true
             def apply(tp: Type): Type = tp match {
-              case TypeRef(RefinedThis(`pre`), name) if name.isLambdaArgName =>
+              case TypeRef(RefinedThis(`pre`), name) if name.isHkArgName =>
                 member(name).info match {
                   case TypeAlias(alias) => alias
                   case _ => isSafe = false; tp
@@ -864,7 +913,7 @@ object Types {
             }
           }
           def instArg(tp: Type): Type = tp match {
-            case tp @ TypeAlias(TypeRef(RefinedThis(`pre`), name)) if name.isLambdaArgName =>
+            case tp @ TypeAlias(TypeRef(RefinedThis(`pre`), name)) if name.isHkArgName =>
               member(name).info match {
                 case TypeAlias(alias) => tp.derivedTypeAlias(alias) // needed to keep variance
                 case bounds => bounds
@@ -879,19 +928,17 @@ object Types {
               instantiate(tp)
           }
           /** Reduce rhs of $hkApply to make it stand alone */
-          def betaReduce(tp: Type) =
-            if (pre.parent.isSafeLambda) {
-              val reduced = instTop(tp)
-              if (instantiate.isSafe) reduced else NoType
-            }
-            else NoType
+          def betaReduce(tp: Type) = {
+            val reduced = instTop(tp)
+            if (instantiate.isSafe) reduced else NoType
+          }
           pre.refinedInfo match {
             case TypeAlias(alias) =>
               if (pre.refinedName ne name) loop(pre.parent)
               else if (!pre.refinementRefersToThis) alias
               else alias match {
                 case TypeRef(RefinedThis(`pre`), aliasName) => lookupRefined(aliasName) // (1)
-                case _ => if (name == tpnme.hkApply) betaReduce(alias) else NoType // (2)
+                case _ => if (name == tpnme.hkApply) betaReduce(alias) else NoType // (2) // ### use TypeApplication's betaReduce
               }
             case _ => loop(pre.parent)
           }
@@ -961,7 +1008,7 @@ object Types {
     /** The first parent of this type, AnyRef if list of parents is empty */
     def firstParent(implicit ctx: Context): TypeRef = parents match {
       case p :: _ => p
-      case _ => defn.AnyClass.typeRef
+      case _ => defn.AnyType
     }
 
     /** the self type of the underlying classtype */
@@ -978,6 +1025,14 @@ object Types {
       case pt: PolyType => pt.resultType.paramTypess
       case _ => Nil
     }
+
+    /** The parameter names of a PolyType or MethodType, Empty list for others */
+    final def paramNamess(implicit ctx: Context): List[List[TermName]] = this match {
+      case mt: MethodType => mt.paramNames :: mt.resultType.paramNamess
+      case pt: PolyType => pt.resultType.paramNamess
+      case _ => Nil
+    }
+
 
     /** The parameter types in the first parameter section of a PolyType or MethodType, Empty list for others */
     final def firstParamTypes(implicit ctx: Context): List[Type] = this match {
@@ -1098,7 +1153,7 @@ object Types {
     def toFunctionType(dropLast: Int = 0)(implicit ctx: Context): Type = this match {
       case mt @ MethodType(_, formals) if !mt.isDependent || ctx.mode.is(Mode.AllowDependentFunctions) =>
         val formals1 = if (dropLast == 0) formals else formals dropRight dropLast
-        defn.FunctionType(
+        defn.FunctionOf(
             formals1 mapConserve (_.underlyingIfRepeated(mt.isJava)), mt.resultType)
     }
 
@@ -1370,7 +1425,11 @@ object Types {
       if (owner.isTerm) d else d.asSeenFrom(prefix)
     }
 
-    private def checkSymAssign(sym: Symbol)(implicit ctx: Context) =
+    private def checkSymAssign(sym: Symbol)(implicit ctx: Context) = {
+      def selfTypeOf(sym: Symbol) = sym.owner.info match {
+        case info: ClassInfo => info.givenSelfType
+        case _ => NoType
+      }
       assert(
         (lastSymbol eq sym) ||
         (lastSymbol eq null) || {
@@ -1382,9 +1441,16 @@ object Types {
           (lastDefRunId == NoRunId)
         } ||
         (lastSymbol.infoOrCompleter == ErrorType ||
-        sym.owner.derivesFrom(lastSymbol.owner) && sym.owner != lastSymbol.owner
-      ),
-        s"data race? overwriting symbol of ${this.show} / $this / ${this.getClass} / ${lastSymbol.id} / ${sym.id} / ${sym.owner} / ${lastSymbol.owner} / ${ctx.phase}")
+        sym.owner != lastSymbol.owner &&
+        (sym.owner.derivesFrom(lastSymbol.owner) ||
+         selfTypeOf(sym).derivesFrom(lastSymbol.owner) ||
+         selfTypeOf(lastSymbol).derivesFrom(sym.owner))),
+        s"""data race? overwriting symbol of type ${this.show},
+           |long form = $this of class ${this.getClass},
+           |last sym id = ${lastSymbol.id}, new sym id = ${sym.id},
+           |last owner = ${lastSymbol.owner}, new owner = ${sym.owner},
+           |period = ${ctx.phase} at run ${ctx.runId}""".stripMargin)
+    }
 
     protected def sig: Signature = Signature.NotAMethod
 
@@ -1506,14 +1572,53 @@ object Types {
       ctx.underlyingRecursions -= 1
     }
 
+    /** A selection of the same kind, but with potentially a differet prefix.
+     *  The following normalizations are performed for type selections T#A:
+     *
+     *     T#A --> B                if A is bound to an alias `= B` in T
+     *
+     *  If Config.splitProjections is set:
+     *
+     *     (S & T)#A --> S#A        if T does not have a member named A
+     *               --> T#A        if S does not have a member named A
+     *               --> S#A & T#A  otherwise
+     *     (S | T)#A --> S#A | T#A
+     */
     def derivedSelect(prefix: Type)(implicit ctx: Context): Type =
       if (prefix eq this.prefix) this
-      else {
+      else if (isType) {
         val res = prefix.lookupRefined(name)
         if (res.exists) res
-        else if (name == tpnme.hkApply && prefix.noHK) derivedSelect(prefix.EtaExpandCore)
+        else if (name == tpnme.hkApply && prefix.classNotLambda) {
+          // After substitution we might end up with a type like
+          // `C { type hk$0 = T0; ...; type hk$n = Tn } # $Apply`
+          // where C is a class. In that case we eta expand `C`.
+          if (defn.isBottomType(prefix)) prefix.classSymbol.typeRef
+          else derivedSelect(prefix.EtaExpandCore)
+        }
+        else if (Config.splitProjections)
+          prefix match {
+            case prefix: AndType =>
+              def isMissing(tp: Type) = tp match {
+                case tp: TypeRef => !tp.info.exists
+                case _ => false
+              }
+              val derived1 = derivedSelect(prefix.tp1)
+              val derived2 = derivedSelect(prefix.tp2)
+              return (
+                if (isMissing(derived1)) derived2
+                else if (isMissing(derived2)) derived1
+                else prefix.derivedAndType(derived1, derived2))
+            case prefix: OrType =>
+              val derived1 = derivedSelect(prefix.tp1)
+              val derived2 = derivedSelect(prefix.tp2)
+              return prefix.derivedOrType(derived1, derived2)
+            case _ =>
+              newLikeThis(prefix)
+          }
         else newLikeThis(prefix)
       }
+      else newLikeThis(prefix)
 
     /** Create a NamedType of the same kind as this type, but with a new prefix.
      */
@@ -1555,6 +1660,15 @@ object Types {
       case _ =>
         false
     }
+
+    /* A version of toString which also prints aliases. Can be used for debugging
+    override def toString =
+      if (isTerm) s"TermRef($prefix, $name)"
+      else s"TypeRef($prefix, $name)${
+        if (lastDenotation != null && lastDenotation.infoOrCompleter.isAlias)
+          s"@@@ ${lastDenotation.infoOrCompleter.asInstanceOf[TypeAlias].hi}"
+        else ""}"
+    */
   }
 
   abstract case class TermRef(override val prefix: Type, name: TermName) extends NamedType with SingletonType {
@@ -1654,8 +1768,9 @@ object Types {
     override def computeHash = unsupported("computeHash")
   }
 
-  final class TermRefWithFixedSym(prefix: Type, name: TermName, val fixedSym: TermSymbol) extends TermRef(prefix, name) with WithFixedSym
-  final class TypeRefWithFixedSym(prefix: Type, name: TypeName, val fixedSym: TypeSymbol) extends TypeRef(prefix, name) with WithFixedSym
+  // Those classes are non final as Linker extends them.
+  class TermRefWithFixedSym(prefix: Type, name: TermName, val fixedSym: TermSymbol) extends TermRef(prefix, name) with WithFixedSym
+  class TypeRefWithFixedSym(prefix: Type, name: TypeName, val fixedSym: TypeSymbol) extends TypeRef(prefix, name) with WithFixedSym
 
   /** Assert current phase does not have erasure semantics */
   private def assertUnerased()(implicit ctx: Context) =
@@ -1726,6 +1841,10 @@ object Types {
         withFixedSym(prefix, name, sym)
       else if (sym.defRunId != NoRunId && sym.isCompleted)
         withSig(prefix, name, sym.signature) withSym (sym, sym.signature)
+        // Linker note:
+        // this is problematic, as withSig method could return a hash-consed refference
+        // that could have symbol already set making withSym trigger a double-binding error
+        // ./tests/run/absoverride.scala demonstates this
       else
         all(prefix, name) withSym (sym, Signature.NotAMethod)
 
@@ -1751,8 +1870,8 @@ object Types {
 
   object TypeRef {
     def checkProjection(prefix: Type, name: TypeName)(implicit ctx: Context) =
-      if (name == tpnme.hkApply && prefix.noHK)
-        assert(false, s"bad type : $prefix.$name should not be $$applied")
+      if (name == tpnme.hkApply && prefix.classNotLambda)
+        assert(false, s"bad type : $prefix.$name does not allow $$Apply projection")
 
     /** Create type ref with given prefix and name */
     def apply(prefix: Type, name: TypeName)(implicit ctx: Context): TypeRef = {
@@ -1892,20 +2011,15 @@ object Types {
 
     override def underlying(implicit ctx: Context) = parent
 
-    private def checkInst(implicit ctx: Context): this.type = {
-      if (Config.checkLambdaVariance)
-        refinedInfo match {
-          case refinedInfo: TypeBounds if refinedInfo.variance != 0 && refinedName.isLambdaArgName =>
-            val cls = parent.LambdaClass(forcing = false)
-            if (cls.exists)
-              assert(refinedInfo.variance == cls.typeParams.apply(refinedName.LambdaArgIndex).variance,
-                  s"variance mismatch for $this, $cls, ${cls.typeParams}, ${cls.typeParams.apply(refinedName.LambdaArgIndex).variance}, ${refinedInfo.variance}")
-          case _ =>
+    private def badInst =
+      throw new AssertionError(s"bad instantiation: $this")
+
+    def checkInst(implicit ctx: Context): this.type = {
+      if (refinedName == tpnme.hkApply)
+        parent.stripTypeVar match {
+          case RefinedType(_, name) if name.isHkArgName => // ok
+          case _ => badInst
         }
-      if (Config.checkProjections &&
-          (refinedName == tpnme.hkApply || refinedName.isLambdaArgName) &&
-          parent.noHK)
-        assert(false, s"illegal refinement of first-order type: $this")
       this
     }
 
@@ -1927,7 +2041,7 @@ object Types {
         false
     }
     override def computeHash = doHash(refinedName, refinedInfo, parent)
-    override def toString = s"RefinedType($parent, $refinedName, $refinedInfo | $hashCode)" // !!! TODO: remove
+    override def toString = s"RefinedType($parent, $refinedName, $refinedInfo)"
   }
 
   class CachedRefinedType(parent: Type, refinedName: Name, infoFn: RefinedType => Type) extends RefinedType(parent, refinedName) {
@@ -2192,7 +2306,7 @@ object Types {
     def fromSymbols(params: List[Symbol], resultType: Type)(implicit ctx: Context) = {
       def translateRepeated(tp: Type): Type = tp match {
         case tp @ ExprType(tp1) => tp.derivedExprType(translateRepeated(tp1))
-        case AnnotatedType(annot, tp) if annot matches defn.RepeatedAnnot =>
+        case AnnotatedType(tp, annot) if annot matches defn.RepeatedAnnot =>
           val typeSym = tp.typeSymbol.asClass
           assert(typeSym == defn.SeqClass || typeSym == defn.ArrayClass)
           tp.translateParameterized(typeSym, defn.RepeatedParamClass)
@@ -2249,15 +2363,22 @@ object Types {
     }
   }
 
-  case class PolyType(paramNames: List[TypeName])(paramBoundsExp: PolyType => List[TypeBounds], resultTypeExp: PolyType => Type)
+  abstract case class PolyType(paramNames: List[TypeName])(paramBoundsExp: PolyType => List[TypeBounds], resultTypeExp: PolyType => Type)
     extends CachedGroundType with BindingType with TermType with MethodOrPoly {
 
     val paramBounds = paramBoundsExp(this)
     val resType = resultTypeExp(this)
 
+    assert(resType ne null)
+
     override def resultType(implicit ctx: Context) = resType
 
     protected def computeSignature(implicit ctx: Context) = resultSignature
+
+    def isPolymorphicMethodType: Boolean = resType match {
+      case _: MethodType => true
+      case _ => false
+    }
 
     def instantiate(argTypes: List[Type])(implicit ctx: Context): Type =
       resultType.substParams(this, argTypes)
@@ -2276,13 +2397,26 @@ object Types {
 
     // need to override hashCode and equals to be object identity
     // because paramNames by itself is not discriminatory enough
-    override def equals(other: Any) = this eq other.asInstanceOf[AnyRef]
-    override def computeHash = identityHash
+    override def equals(other: Any) = other match {
+      case other: PolyType =>
+        other.paramNames == this.paramNames && other.paramBounds == this.paramBounds && other.resType == this.resType
+      case _ => false
+    }
+    override def computeHash = {
+      doHash(paramNames, resType, paramBounds)
+    }
 
     override def toString = s"PolyType($paramNames, $paramBounds, $resType)"
   }
 
+  class CachedPolyType(paramNames: List[TypeName])(paramBoundsExp: PolyType => List[TypeBounds], resultTypeExp: PolyType => Type)
+    extends PolyType(paramNames)(paramBoundsExp, resultTypeExp)
+
   object PolyType {
+    def apply(paramNames: List[TypeName])(paramBoundsExp: PolyType => List[TypeBounds], resultTypeExp: PolyType => Type)(implicit ctx: Context): PolyType = {
+      unique(new CachedPolyType(paramNames)(paramBoundsExp, resultTypeExp))
+    }
+
     def fromSymbols(tparams: List[Symbol], resultType: Type)(implicit ctx: Context) =
       if (tparams.isEmpty) resultType
       else {
@@ -2358,7 +2492,8 @@ object Types {
     // no customized hashCode/equals needed because cycle is broken in PolyType
     override def toString = s"PolyParam(${binder.paramNames(paramNum)})"
 
-    override def computeHash = doHash(paramNum, binder)
+    override def computeHash = doHash(paramNum, binder.identityHash)
+
     override def equals(that: Any) = that match {
       case that: PolyParam =>
         (this.binder eq that.binder) && this.paramNum == that.paramNum
@@ -2386,11 +2521,11 @@ object Types {
   // ----- Skolem types -----------------------------------------------
 
   /** A skolem type reference with underlying type `binder`. */
-  abstract case class SkolemType(info: Type) extends CachedProxyType with ValueType with SingletonType {
+  abstract case class SkolemType(info: Type) extends UncachedProxyType with ValueType with SingletonType {
     override def underlying(implicit ctx: Context) = info
     def derivedSkolemType(info: Type)(implicit ctx: Context) =
       if (info eq this.info) this else SkolemType(info)
-    override def computeHash: Int = identityHash
+    override def hashCode: Int = identityHash
     override def equals(that: Any) = this eq that.asInstanceOf[AnyRef]
     override def toString = s"Skolem($info)"
   }
@@ -2438,7 +2573,10 @@ object Types {
      *  uninstantiated
      */
     def instanceOpt(implicit ctx: Context): Type =
-      if (inst.exists) inst else ctx.typerState.instType(this)
+      if (inst.exists) inst else {
+        ctx.typerState.ephemeral = true
+        ctx.typerState.instType(this)
+      }
 
     /** Is the variable already instantiated? */
     def isInstantiated(implicit ctx: Context) = instanceOpt.exists
@@ -2606,10 +2744,12 @@ object Types {
       def clsDenot = if (prefix eq cls.owner.thisType) cls.denot else cls.denot.copySymDenotation(info = this)
       if (typeRefCache == null)
         typeRefCache =
-          if ((cls is PackageClass) || cls.owner.isTerm) prefix select cls
-          else prefix select (cls.name, clsDenot)
+          if ((cls is PackageClass) || cls.owner.isTerm) symbolicTypeRef
+          else TypeRef(prefix, cls.name, clsDenot)
       typeRefCache
     }
+
+    def symbolicTypeRef(implicit ctx: Context): Type = TypeRef(prefix, cls)
 
     // cached because baseType needs parents
     private var parentsCache: List[TypeRef] = null
@@ -2675,8 +2815,12 @@ object Types {
       case _ => this
     }
 
-    def contains(tp: Type)(implicit ctx: Context) = tp match {
+    def contains(tp: Type)(implicit ctx: Context): Boolean = tp match {
       case tp: TypeBounds => lo <:< tp.lo && tp.hi <:< hi
+      case tp: ClassInfo =>
+        // Note: Taking a normal typeRef does not work here. A normal ref might contain
+        // also other information about the named type (e.g. bounds).
+        contains(tp.symbolicTypeRef)
       case _ => lo <:< tp && tp <:< hi
     }
 
@@ -2711,7 +2855,7 @@ object Types {
     }
 
     override def toString =
-      if (lo eq hi) s"TypeAlias($lo)" else s"TypeBounds($lo, $hi)"
+      if (lo eq hi) s"TypeAlias($lo, $variance)" else s"TypeBounds($lo, $hi)"
   }
 
   class RealTypeBounds(lo: Type, hi: Type) extends TypeBounds(lo, hi) {
@@ -2720,9 +2864,9 @@ object Types {
 
   abstract class TypeAlias(val alias: Type, override val variance: Int) extends TypeBounds(alias, alias) {
     /** pre: this is a type alias */
-    def derivedTypeAlias(tp: Type, variance: Int = this.variance)(implicit ctx: Context) =
-      if ((lo eq tp) && (variance == this.variance)) this
-      else TypeAlias(tp, variance)
+    def derivedTypeAlias(alias: Type, variance: Int = this.variance)(implicit ctx: Context) =
+      if ((alias eq this.alias) && (variance == this.variance)) this
+      else TypeAlias(alias, variance)
 
     override def & (that: TypeBounds)(implicit ctx: Context): TypeBounds = {
       val v = this commonVariance that
@@ -2761,23 +2905,22 @@ object Types {
   // ----- Annotated and Import types -----------------------------------------------
 
   /** An annotated type tpe @ annot */
-  case class AnnotatedType(annot: Annotation, tpe: Type)
+  case class AnnotatedType(tpe: Type, annot: Annotation)
       extends UncachedProxyType with ValueType {
     // todo: cache them? but this makes only sense if annotations and trees are also cached.
     override def underlying(implicit ctx: Context): Type = tpe
-    def derivedAnnotatedType(annot: Annotation, tpe: Type) =
-      if ((annot eq this.annot) && (tpe eq this.tpe)) this
-      else AnnotatedType(annot, tpe)
+    def derivedAnnotatedType(tpe: Type, annot: Annotation) =
+      if ((tpe eq this.tpe) && (annot eq this.annot)) this
+      else AnnotatedType(tpe, annot)
 
     override def stripTypeVar(implicit ctx: Context): Type =
-      derivedAnnotatedType(annot, tpe.stripTypeVar)
+      derivedAnnotatedType(tpe.stripTypeVar, annot)
     override def stripAnnots(implicit ctx: Context): Type = tpe.stripAnnots
   }
 
   object AnnotatedType {
-    def make(annots: List[Annotation], underlying: Type) =
-      if (annots.isEmpty) underlying
-      else (underlying /: annots)((tp, ann) => AnnotatedType(ann, tp))
+    def make(underlying: Type, annots: List[Annotation]) =
+      (underlying /: annots)(AnnotatedType(_, _))
   }
 
   // Special type objects and classes -----------------------------------------------------
@@ -2971,9 +3114,9 @@ object Types {
         case tp: SkolemType =>
           tp.derivedSkolemType(this(tp.info))
 
-        case tp @ AnnotatedType(annot, underlying) =>
+        case tp @ AnnotatedType(underlying, annot) =>
           val underlying1 = this(underlying)
-          if (underlying1 eq underlying) tp else tp.derivedAnnotatedType(mapOver(annot), underlying1)
+          if (underlying1 eq underlying) tp else tp.derivedAnnotatedType(underlying1, mapOver(annot))
 
         case tp @ WildcardType =>
           tp.derivedWildcardType(mapOver(tp.optBounds))
@@ -3113,7 +3256,7 @@ object Types {
       case tp: SkolemType =>
         this(x, tp.info)
 
-      case AnnotatedType(annot, underlying) =>
+      case AnnotatedType(underlying, annot) =>
         this(applyToAnnot(x, annot), underlying)
 
       case tp: TypeVar =>
@@ -3145,6 +3288,10 @@ object Types {
   class ForeachAccumulator(p: Type => Unit)(implicit ctx: Context) extends TypeAccumulator[Unit] {
     override def stopAtStatic = false
     def apply(x: Unit, tp: Type): Unit = foldOver(p(tp), tp)
+  }
+
+  class HasUnsafeNonAccumulator(implicit ctx: Context) extends TypeAccumulator[Boolean] {
+    def apply(x: Boolean, tp: Type) = x || tp.isUnsafeNonvariant || foldOver(x, tp)
   }
 
   class NamedPartsAccumulator(p: NamedType => Boolean)(implicit ctx: Context) extends TypeAccumulator[mutable.Set[NamedType]] {
@@ -3255,14 +3402,14 @@ object Types {
       val ex = new CyclicReference(denot)
       if (!(ctx.mode is typer.Mode.CheckCyclic)) {
         cyclicErrors.println(ex.getMessage)
-        for (elem <- ex.getStackTrace take 50)
+        for (elem <- ex.getStackTrace take 200)
           cyclicErrors.println(elem.toString)
       }
       ex
     }
   }
 
-  class MergeError(msg: String) extends TypeError(msg)
+  class MergeError(msg: String, val tp1: Type, val tp2: Type) extends TypeError(msg)
 
   // ----- Debug ---------------------------------------------------------
 

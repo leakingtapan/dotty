@@ -46,10 +46,9 @@ trait TypeAssigner {
         // TODO: measure the cost of using `existsPart`, and if necessary replace it
         // by a `TypeAccumulator` where we have set `stopAtStatic = true`.
         tp existsPart {
-          case tp: NamedType =>
-            forbidden contains tp.symbol
-          case _ =>
-            false
+          case tp: NamedType => forbidden contains tp.symbol
+          case tp: ThisType => forbidden contains tp.cls
+          case _ => false
         }
       def apply(tp: Type): Type = tp match {
         case tp: TermRef if toAvoid(tp) && variance > 0 =>
@@ -283,7 +282,7 @@ trait TypeAssigner {
       else if (!mix.isEmpty) findMixinSuper(cls.info)
       else if (inConstrCall || ctx.erasedTypes) cls.info.firstParent
       else {
-        val ps = cls.info.parents
+        val ps = cls.classInfo.instantiatedParents
         if (ps.isEmpty) defn.AnyType else ps.reduceLeft((x: Type, y: Type) => x & y)
       }
     tree.withType(SuperType(cls.thisType, owntype))
@@ -350,7 +349,7 @@ trait TypeAssigner {
 
   def assignType(tree: untpd.SeqLiteral, elems: List[Tree])(implicit ctx: Context) = tree match {
     case tree: JavaSeqLiteral =>
-      tree.withType(defn.ArrayType(ctx.typeComparer.lub(elems.tpes).widen))
+      tree.withType(defn.ArrayOf(ctx.typeComparer.lub(elems.tpes).widen))
     case _ =>
       val ownType =
         if (ctx.erasedTypes) defn.SeqType
@@ -393,19 +392,36 @@ trait TypeAssigner {
     tree.withType(proto)
 
   def assignType(tree: untpd.ValDef, sym: Symbol)(implicit ctx: Context) =
-    tree.withType(if (sym.exists) sym.valRef else NoType)
+    tree.withType(if (sym.exists) assertExists(symbolicIfNeeded(sym).orElse(sym.valRef)) else NoType)
 
   def assignType(tree: untpd.DefDef, sym: Symbol)(implicit ctx: Context) =
-    tree.withType(sym.termRefWithSig)
+    tree.withType(symbolicIfNeeded(sym).orElse(sym.termRefWithSig))
 
   def assignType(tree: untpd.TypeDef, sym: Symbol)(implicit ctx: Context) =
-    tree.withType(sym.typeRef)
+    tree.withType(symbolicIfNeeded(sym).orElse(sym.typeRef))
+
+  private def symbolicIfNeeded(sym: Symbol)(implicit ctx: Context) = {
+    val owner = sym.owner
+    owner.infoOrCompleter match {
+      case info: ClassInfo if info.givenSelfType.exists =>
+        // In that case a simple typeRef/termWithWithSig could return a member of
+        // the self type, not the symbol itself. To avoid this, we make the reference
+        // symbolic. In general it seems to be faster to keep the non-symblic
+        // reference, since there is less pressure on the uniqueness tables that way
+        // and less work to update all the different references. That's why symbolic references
+        // are only used if necessary.
+        NamedType.withFixedSym(owner.thisType, sym)
+      case _ => NoType
+    }
+  }
+
+  def assertExists(tp: Type) = { assert(tp != NoType); tp }
 
   def assignType(tree: untpd.Import, sym: Symbol)(implicit ctx: Context) =
     tree.withType(sym.nonMemberTermRef)
 
   def assignType(tree: untpd.Annotated, annot: Tree, arg: Tree)(implicit ctx: Context) =
-    tree.withType(AnnotatedType(Annotation(annot), arg.tpe))
+    tree.withType(AnnotatedType(arg.tpe, Annotation(annot)))
 
   def assignType(tree: untpd.PackageDef, pid: Tree)(implicit ctx: Context) =
     tree.withType(pid.symbol.valRef)

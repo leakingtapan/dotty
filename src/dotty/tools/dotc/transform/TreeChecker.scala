@@ -23,6 +23,7 @@ import ast.{tpd, untpd}
 import util.SourcePosition
 import collection.mutable
 import ProtoTypes._
+import config.Printers
 import java.lang.AssertionError
 import scala.util.control.NonFatal
 
@@ -79,7 +80,7 @@ class TreeChecker extends Phase with SymTransformer {
     val sym = symd.symbol
 
     if (sym.isClass && !sym.isAbsent) {
-      val validSuperclass = defn.ScalaValueClasses.contains(sym) ||  defn.syntheticCoreClasses.contains(sym) ||
+      val validSuperclass = sym.isPrimitiveValueClass ||  defn.syntheticCoreClasses.contains(sym) ||
         (sym eq defn.ObjectClass) || (sym is NoSuperClass) || (sym.asClass.superClass.exists)
       if (!validSuperclass)
         printError(s"$sym has no superclass set")
@@ -122,9 +123,12 @@ class TreeChecker extends Phase with SymTransformer {
     val checker = new Checker(previousPhases(phasesToRun.toList)(ctx))
     try checker.typedExpr(ctx.compilationUnit.tpdTree)(checkingCtx)
     catch {
-      case NonFatal(ex) =>
+      case NonFatal(ex) =>     //TODO CHECK. Check that we are bootstrapped
         implicit val ctx: Context = checkingCtx
-        ctx.println(i"*** error while checking after phase ${checkingCtx.phase.prev} ***")
+        ctx.println(i"*** error while checking ${ctx.compilationUnit} after phase ${checkingCtx.phase.prev} ***")
+        ctx.println(ex.toString)
+        ctx.println(ex.getStackTrace.take(30).deep.mkString("\n"))
+        ctx.println("<<<")
         throw ex
     }
   }

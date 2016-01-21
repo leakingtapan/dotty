@@ -18,6 +18,7 @@ import config.Printers._
 import Annotations._
 import Inferencing._
 import transform.ValueClasses._
+import TypeApplications._
 import language.implicitConversions
 
 trait NamerContextOps { this: Context =>
@@ -477,9 +478,30 @@ class Namer { typer: Typer =>
   }
 
   /** The completer of a symbol defined by a member def or import (except ClassSymbols) */
-  class Completer(val original: Tree)(implicit ctx: Context) extends LazyType {
+  class Completer(val original: Tree)(implicit ctx: Context) extends TypeParamsCompleter {
 
     protected def localContext(owner: Symbol) = ctx.fresh.setOwner(owner).setTree(original)
+
+    private var myTypeParams: List[TypeSymbol] = null
+    private var nestedCtx: Context = null
+
+    def completerTypeParams(sym: Symbol): List[TypeSymbol] = {
+      if (myTypeParams == null) {
+        //println(i"completing type params of $sym in ${sym.owner}")
+        myTypeParams = original match {
+          case tdef: TypeDef =>
+            nestedCtx = localContext(sym).setNewScope
+            locally {
+              implicit val ctx: Context = nestedCtx
+              completeParams(tdef.tparams)
+              tdef.tparams.map(symbolOfTree(_).asType)
+            }
+          case _ =>
+            Nil
+        }
+      }
+      myTypeParams
+    }
 
     private def typeSig(sym: Symbol): Type = original match {
       case original: ValDef =>
@@ -491,7 +513,7 @@ class Namer { typer: Typer =>
         typer1.defDefSig(original, sym)(localContext(sym).setTyper(typer1))
       case original: TypeDef =>
         assert(!original.isClassDef)
-        typeDefSig(original, sym)(localContext(sym).setNewScope)
+        typeDefSig(original, sym, completerTypeParams(sym))(nestedCtx)
       case imp: Import =>
         try {
           val expr1 = typedAheadExpr(imp.expr, AnySelectionProto)
@@ -578,8 +600,13 @@ class Namer { typer: Typer =>
         else {
           val pt = checkClassTypeWithStablePrefix(ptype, parent.pos, traitReq = parent ne parents.head)
           if (pt.derivesFrom(cls)) {
-            ctx.error(i"cyclic inheritance: $cls extends itself", parent.pos)
-            defn.ObjectClass.typeRef
+            val addendum = parent match {
+              case Select(qual: Super, _) if ctx.scala2Mode =>
+                "\n(Note that inheriting a class of the same name is no longer allowed)"
+              case _ => ""
+            }
+            ctx.error(i"cyclic inheritance: $cls extends itself$addendum", parent.pos)
+            defn.ObjectType
           }
           else pt
         }
@@ -788,9 +815,36 @@ class Namer { typer: Typer =>
   /** The type signature of a DefDef with given symbol */
   def defDefSig(ddef: DefDef, sym: Symbol)(implicit ctx: Context) = {
     val DefDef(name, tparams, vparamss, _, _) = ddef
-    completeParams(tparams)
-    vparamss foreach completeParams
     val isConstructor = name == nme.CONSTRUCTOR
+
+    // The following 3 lines replace what was previously just completeParams(tparams).
+    // But that can cause bad bounds being computed, as witnessed by
+    // tests/pos/paramcycle.scala. The problematic sequence is this:
+    //   0. Class constructor gets completed.
+    //   1. Type parameter CP of constructor gets completed
+    //   2. As a first step CP's bounds are set to Nothing..Any.
+    //   3. CP's real type bound demands the completion of corresponding type parameter DP
+    //      of enclosing class.
+    //   4. Type parameter DP has a rhs a DerivedFromParam tree, as installed by
+    //      desugar.classDef
+    //   5. The completion of DP then copies the current bounds of CP, which are still Nothing..Any.
+    //   6. The completion of CP finishes installing the real type bounds.
+    // Consequence: CP ends up with the wrong bounds!
+    // To avoid this we always complete type parameters of a class before the type parameters
+    // of the class constructor, but after having indexed the constructor parameters (because
+    // indexing is needed to provide a symbol to copy for DP's completion.
+    // With the patch, we get instead the following sequence:
+    //   0. Class constructor gets completed.
+    //   1. Class constructor parameter CP is indexed.
+    //   2. Class parameter DP starts completion.
+    //   3. Info of CP is computed (to be copied to DP).
+    //   4. CP is completed.
+    //   5. Info of CP is copied to DP and DP is completed.
+    index(tparams)
+    if (isConstructor) sym.owner.typeParams.foreach(_.ensureCompleted())
+    for (tparam <- tparams) typedAheadExpr(tparam)
+
+    vparamss foreach completeParams
     def typeParams = tparams map symbolOfTree
     val paramSymss = ctx.normalizeIfConstructor(vparamss.nestedMap(symbolOfTree), isConstructor)
     def wrapMethType(restpe: Type): Type = {
@@ -807,9 +861,7 @@ class Namer { typer: Typer =>
     else valOrDefDefSig(ddef, sym, typeParams, paramSymss, wrapMethType)
   }
 
-  def typeDefSig(tdef: TypeDef, sym: Symbol)(implicit ctx: Context): Type = {
-    completeParams(tdef.tparams)
-    val tparamSyms = tdef.tparams map symbolOfTree
+  def typeDefSig(tdef: TypeDef, sym: Symbol, tparamSyms: List[TypeSymbol])(implicit ctx: Context): Type = {
     val isDerived = tdef.rhs.isInstanceOf[untpd.DerivedTypeTree]
     //val toParameterize = tparamSyms.nonEmpty && !isDerived
     //val needsLambda = sym.allOverriddenSymbols.exists(_ is HigherKinded) && !isDerived
@@ -817,7 +869,9 @@ class Namer { typer: Typer =>
       if (tparamSyms.nonEmpty && !isDerived) tp.LambdaAbstract(tparamSyms)
       //else if (toParameterize) tp.parameterizeWith(tparamSyms)
       else tp
-    sym.info = abstracted(TypeBounds.empty)
+
+    val dummyInfo = abstracted(TypeBounds.empty)
+    sym.info = dummyInfo
       // Temporarily set info of defined type T to ` >: Nothing <: Any.
       // This is done to avoid cyclic reference errors for F-bounds.
       // This is subtle: `sym` has now an empty TypeBounds, but is not automatically
@@ -833,33 +887,45 @@ class Namer { typer: Typer =>
       case bounds: TypeBounds => bounds
       case alias => TypeAlias(alias, if (sym is Local) sym.variance else 0)
     }
-    sym.info = NoCompleter
-    sym.info = checkNonCyclic(sym, unsafeInfo, reportErrors = true)
+    if (isDerived) sym.info = unsafeInfo
+    else {
+      sym.info = NoCompleter
+      sym.info = checkNonCyclic(sym, unsafeInfo, reportErrors = true)
+    }
+
+    // Here we pay the price for the cavalier setting info to TypeBounds.empty above.
+    // We need to compensate by invalidating caches in references that might
+    // still contain the TypeBounds.empty. If we do not do this, stdlib factories
+    // fail with a bounds error in PostTyper.
+    def ensureUpToDate(tp: Type, outdated: Type) = tp match {
+      case tref: TypeRef if tref.info == outdated && sym.info != outdated =>
+        tref.uncheckedSetSym(null)
+      case _ =>
+    }
+    ensureUpToDate(sym.typeRef, dummyInfo)
+    ensureUpToDate(sym.typeRef.appliedTo(tparamSyms.map(_.typeRef)), TypeBounds.empty)
+
     etaExpandArgs.apply(sym.info)
   }
 
   /** Eta expand all class types C appearing as arguments to a higher-kinded
    *  type parameter to type lambdas, e.g. [HK0] => C[HK0]. This is necessary
-   *  because in `typedAppliedTypeTree` we might ahve missed some eta expansions
+   *  because in `typedAppliedTypeTree` we might have missed some eta expansions
    *  of arguments in F-bounds, because the recursive type was initialized with
    *  TypeBounds.empty.
    */
   def etaExpandArgs(implicit ctx: Context) = new TypeMap {
-    def apply(tp: Type): Type = {
-      tp match {
-        case tp: RefinedType =>
-          val args = tp.argInfos(interpolate = false).mapconserve(this)
-          if (args.nonEmpty) {
-            val tycon = tp.withoutArgs(args)
-            val tparams = tycon.typeParams
-            if (args.length == tparams.length) { // if lengths differ, problem is caught in typedTypeApply
-              val args1 = args.zipWithConserve(tparams)((arg, tparam) => arg.EtaExpandIfHK(tparam.info))
-              if (args1 ne args) return this(tycon).appliedTo(args1)
-            }
-          }
-        case _ =>
-      }
-      mapOver(tp)
+    def apply(tp: Type): Type = tp match {
+      case tp: RefinedType =>
+        val args = tp.argInfos.mapconserve(this)
+        if (args.nonEmpty) {
+          val tycon = tp.withoutArgs(args)
+          val tycon1 = this(tycon)
+          val tparams = tycon.typeParams
+          val args1 = if (args.length == tparams.length) etaExpandIfHK(tparams, args) else args
+          if ((tycon1 eq tycon) && (args1 eq args)) tp else tycon1.appliedTo(args1)
+        } else mapOver(tp)
+      case _ => mapOver(tp)
     }
   }
 }

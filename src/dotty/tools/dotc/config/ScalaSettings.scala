@@ -18,6 +18,7 @@ class ScalaSettings extends Settings.SettingGroup {
    */
   val dependencyfile = StringSetting("-dependencyfile", "file", "Set dependency tracking file.", ".scala_dependencies")
   val deprecation = BooleanSetting("-deprecation", "Emit warning and location for usages of deprecated APIs.")
+  val migration = BooleanSetting("-migration", "Emit warning and location for migration issues from Scala 2.")
   val encoding = StringSetting("-encoding", "encoding", "Specify character encoding used by source files.", Properties.sourceEncoding)
   val explaintypes = BooleanSetting("-explaintypes", "Explain type errors in more detail.")
   val feature = BooleanSetting("-feature", "Emit warning and location for usages of features that should be imported explicitly.")
@@ -172,6 +173,7 @@ class ScalaSettings extends Settings.SettingGroup {
   val Ypatmatdebug = BooleanSetting("-Ypatmat-debug", "Trace pattern matching translation.")
   val Yexplainlowlevel = BooleanSetting("-Yexplain-lowlevel", "When explaining type errors, show types at a lower level.")
   val YnoDoubleBindings = BooleanSetting("-Yno-double-bindings", "Assert no namedtype is bound twice (should be enabled only if program is error-free).")
+  val YshowVarBounds = BooleanSetting("-Yshow-var-bounds", "Print type variables with their bounds")
 
   val optimise = BooleanSetting("-optimise", "Generates faster bytecode by applying optimisations to the program") withAbbreviation "-optimize"
 

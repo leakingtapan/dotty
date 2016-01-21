@@ -5,8 +5,10 @@ package core
 import Contexts._, Types._, Symbols._, Names._, Flags._, Scopes._
 import SymDenotations._, Denotations.Denotation
 import config.Printers._
+import util.Positions._
 import Decorators._
 import StdNames._
+import Annotations._
 import util.SimpleMap
 import collection.mutable
 import ast.tpd._
@@ -22,31 +24,29 @@ trait TypeOps { this: Context => // TODO: Make standalone object.
    *
    *  and an expression `e` of type `C`. Then computing the type of `e.f` leads
    *  to the query asSeenFrom(`C`, `(x: T)T`). What should its result be? The
-   *  naive answer `(x: C.T)C.T` is incorrect given that we treat `C.T` as the existential
+   *  naive answer `(x: C#T)C#T` is incorrect given that we treat `C#T` as the existential
    *  `exists(c: C)c.T`. What we need to do instead is to skolemize the existential. So
    *  the answer would be `(x: c.T)c.T` for some (unknown) value `c` of type `C`.
    *  `c.T` is expressed in the compiler as a skolem type `Skolem(C)`.
    *
    *  Now, skolemization is messy and expensive, so we want to do it only if we absolutely
-   *  must. We must skolemize if an unstable prefix is used in nonvariant or
-   *  contravariant position of the return type of asSeenFrom.
+   *  must. Also, skolemizing immediately would mean that asSeenFrom was no longer
+   *  idempotent - each call would return a type with a different skolem.
+   *  Instead we produce an annotated type that marks the prefix as unsafe:
    *
-   *  In the implementation of asSeenFrom, we first try to run asSeenFrom without
-   *  skolemizing. If that would be incorrect we will be told by the fact that
-   *  `unstable` is set in the passed AsSeenFromMap. In that case we run asSeenFrom
-   *  again with a skolemized prefix.
+   *     (x: (C @ UnsafeNonvariant)#T)C#T
+
+   *  We also set a global state flag `unsafeNonvariant` to the current run.
+   *  When typing a Select node, typer will check that flag, and if it
+   *  points to the current run will scan the result type of the select for
+   *  @UnsafeNonvariant annotations. If it finds any, it will introduce a skolem
+   *  constant for the prefix and try again.
    *
-   *  In the interest of speed we want to avoid creating an AsSeenFromMap every time
-   *  asSeenFrom is called. So we do this here only if the prefix is unstable
-   *  (because then we need the map as a container for the unstable field). For
-   *  stable prefixes the map is `null`; it might however be instantiated later
-   *  for more complicated types.
+   *  The scheme is efficient in particular because we expect that unsafe situations are rare;
+   *  most compiles would contain none, so no scanning would be necessary.
    */
-  final def asSeenFrom(tp: Type, pre: Type, cls: Symbol): Type = {
-    val m = if (isLegalPrefix(pre)) null else new AsSeenFromMap(pre, cls)
-    var res = asSeenFrom(tp, pre, cls, m)
-    if (m != null && m.unstable) asSeenFrom(tp, SkolemType(pre), cls) else res
-  }
+  final def asSeenFrom(tp: Type, pre: Type, cls: Symbol): Type =
+    asSeenFrom(tp, pre, cls, null)
 
   /** Helper method, taking a map argument which is instantiated only for more
    *  complicated cases of asSeenFrom.
@@ -60,18 +60,21 @@ trait TypeOps { this: Context => // TODO: Make standalone object.
     def toPrefix(pre: Type, cls: Symbol, thiscls: ClassSymbol): Type = /*>|>*/ ctx.conditionalTraceIndented(TypeOps.track, s"toPrefix($pre, $cls, $thiscls)") /*<|<*/ {
       if ((pre eq NoType) || (pre eq NoPrefix) || (cls is PackageClass))
         tp
-      else if (thiscls.derivesFrom(cls) && pre.baseTypeRef(thiscls).exists) {
-        if (theMap != null && theMap.currentVariance <= 0 && !isLegalPrefix(pre))
-          theMap.unstable = true
-        pre match {
-          case SuperType(thispre, _) => thispre
-          case _ => pre
-        }
+      else pre match {
+        case pre: SuperType => toPrefix(pre.thistpe, cls, thiscls)
+        case _ =>
+          if (thiscls.derivesFrom(cls) && pre.baseTypeRef(thiscls).exists) {
+            if (theMap != null && theMap.currentVariance <= 0 && !isLegalPrefix(pre)) {
+              ctx.base.unsafeNonvariant = ctx.runId
+              AnnotatedType(pre, Annotation(defn.UnsafeNonvariantAnnot, Nil))
+            }
+            else pre
+          }
+          else if ((pre.termSymbol is Package) && !(thiscls is Package))
+            toPrefix(pre.select(nme.PACKAGE), cls, thiscls)
+          else
+            toPrefix(pre.baseTypeRef(cls).normalizedPrefix, cls.owner, thiscls)
       }
-      else if ((pre.termSymbol is Package) && !(thiscls is Package))
-        toPrefix(pre.select(nme.PACKAGE), cls, thiscls)
-      else
-        toPrefix(pre.baseTypeRef(cls).normalizedPrefix, cls.owner, thiscls)
     }
 
     /*>|>*/ ctx.conditionalTraceIndented(TypeOps.track, s"asSeen ${tp.show} from (${pre.show}, ${cls.show})", show = true) /*<|<*/ { // !!! DEBUG
@@ -80,17 +83,14 @@ trait TypeOps { this: Context => // TODO: Make standalone object.
           val sym = tp.symbol
           if (sym.isStatic) tp
           else {
-            val prevStable = theMap == null || !theMap.unstable
             val pre1 = asSeenFrom(tp.prefix, pre, cls, theMap)
-            if (theMap != null && theMap.unstable && prevStable) {
+            if (pre1.isUnsafeNonvariant)
               pre1.member(tp.name).info match {
                 case TypeAlias(alias) =>
                   // try to follow aliases of this will avoid skolemization.
-                  theMap.unstable = false
                   return alias
                 case _ =>
               }
-            }
             tp.derivedSelect(pre1)
           }
         case tp: ThisType =>
@@ -102,7 +102,7 @@ trait TypeOps { this: Context => // TODO: Make standalone object.
             asSeenFrom(tp.parent, pre, cls, theMap),
             tp.refinedName,
             asSeenFrom(tp.refinedInfo, pre, cls, theMap))
-        case tp: TypeAlias if theMap == null => // if theMap exists, need to do the variance calculation
+        case tp: TypeAlias if tp.variance == 1 => // if variance != 1, need to do the variance calculation
           tp.derivedTypeAlias(asSeenFrom(tp.alias, pre, cls, theMap))
         case _ =>
           (if (theMap != null) theMap else new AsSeenFromMap(pre, cls))
@@ -120,11 +120,6 @@ trait TypeOps { this: Context => // TODO: Make standalone object.
 
     /** A method to export the current variance of the map */
     def currentVariance = variance
-
-    /** A field which indicates whether an unstable argument in nonvariant
-     *  or contravariant position was encountered.
-     */
-    var unstable = false
   }
 
   /** Approximate a type `tp` with a type that does not contain skolem types.
@@ -383,10 +378,9 @@ trait TypeOps { this: Context => // TODO: Make standalone object.
         denot.info = info
       }
     }
-    val typeArgFlag = if (formal is Local) TypeArgument else EmptyFlags
     val sym = ctx.newSymbol(
       cls, formal.name,
-      formal.flagsUNSAFE & RetainedTypeArgFlags | typeArgFlag | Override,
+      formal.flagsUNSAFE & RetainedTypeArgFlags | BaseTypeArg | Override,
       lazyInfo,
       coord = cls.coord)
     cls.enter(sym, decls)
@@ -462,14 +456,20 @@ trait TypeOps { this: Context => // TODO: Make standalone object.
       case to @ TypeBounds(lo1, hi1) if lo1 eq hi1 =>
         for (pref <- prefs)
           for (argSym <- pref.decls)
-            if (argSym is TypeArgument)
+            if (argSym is BaseTypeArg)
               forwardRef(argSym, from, to, cls, decls)
       case _ =>
     }
 
     // println(s"normalizing $parents of $cls in ${cls.owner}") // !!! DEBUG
+
+    // A map consolidating all refinements arising from parent type parameters
     var refinements: SimpleMap[TypeName, Type] = SimpleMap.Empty
-    var formals: SimpleMap[TypeName, Symbol] = SimpleMap.Empty
+
+    // A map of all formal type parameters of base classes that get refined
+    var formals: SimpleMap[TypeName, Symbol] = SimpleMap.Empty // A map of all formal parent parameter
+
+    // Strip all refinements from parent type, populating `refinements` and `formals` maps.
     def normalizeToRef(tp: Type): TypeRef = tp.dealias match {
       case tp: TypeRef =>
         tp
@@ -480,20 +480,24 @@ trait TypeOps { this: Context => // TODO: Make standalone object.
         formals = formals.updated(name, tp1.typeParamNamed(name))
         normalizeToRef(tp1)
       case ErrorType =>
-        defn.AnyClass.typeRef
-      case AnnotatedType(_, tpe) =>
+        defn.AnyType
+      case AnnotatedType(tpe, _) =>
         normalizeToRef(tpe)
       case _ =>
         throw new TypeError(s"unexpected parent type: $tp")
     }
     val parentRefs = parents map normalizeToRef
+
+    // Enter all refinements into current scope.
     refinements foreachBinding { (name, refinedInfo) =>
       assert(decls.lookup(name) == NoSymbol, // DEBUG
         s"redefinition of ${decls.lookup(name).debugString} in ${cls.showLocated}")
       enterArgBinding(formals(name), refinedInfo, cls, decls)
     }
-    // These two loops cannot be fused because second loop assumes that
-    // all arguments have been entered in `decls`.
+    // Forward definitions in super classes that have one of the refined paramters
+    // as aliases directly to the refined info.
+    // Note that this cannot be fused bwith the previous loop because we now
+    // assume that all arguments have been entered in `decls`.
     refinements foreachBinding { (name, refinedInfo) =>
       forwardRefs(formals(name), refinedInfo, parentRefs)
     }
@@ -572,6 +576,15 @@ trait TypeOps { this: Context => // TODO: Make standalone object.
   /** Is auto-tupling enabled? */
   def canAutoTuple =
     !featureEnabled(defn.LanguageModuleClass, nme.noAutoTupling)
+
+  def scala2Mode =
+    featureEnabled(defn.LanguageModuleClass, nme.Scala2)
+
+  def testScala2Mode(msg: String, pos: Position) = {
+    if (scala2Mode) migrationWarning(msg, pos)
+    scala2Mode
+  }
+
 }
 
 object TypeOps {

@@ -69,7 +69,7 @@ object SymDenotations {
     ownerIfExists: Symbol,
     final val name: Name,
     initFlags: FlagSet,
-    initInfo: Type,
+    final val initInfo: Type,
     initPrivateWithin: Symbol = NoSymbol) extends SingleDenotation(symbol) {
 
     //assert(symbol.id != 4940, name)
@@ -163,6 +163,10 @@ object SymDenotations {
     }
 
     private def completeFrom(completer: LazyType)(implicit ctx: Context): Unit = {
+      if (completions ne noPrinter) {
+        completions.println(i"${"  " * indent}completing ${if (isType) "type" else "val"} $name")
+        indent += 1
+      }
       if (myFlags is Touched) throw CyclicReference(this)
       myFlags |= Touched
 
@@ -173,6 +177,11 @@ object SymDenotations {
           completions.println(s"error while completing ${this.debugString}")
           throw ex
       }
+      finally
+        if (completions ne noPrinter) {
+          indent -= 1
+          completions.println(i"${"  " * indent}completed $name in $owner")
+        }
       // completions.println(s"completed ${this.debugString}")
     }
 
@@ -417,10 +426,12 @@ object SymDenotations {
       name.toTermName == nme.EVT2U
 
     /** Is symbol a primitive value class? */
-    def isPrimitiveValueClass(implicit ctx: Context) = defn.ScalaValueClasses contains symbol
+    def isPrimitiveValueClass(implicit ctx: Context) =
+      maybeOwner == defn.ScalaPackageClass && defn.ScalaValueClasses().contains(symbol)
 
     /** Is symbol a primitive numeric value class? */
-    def isNumericValueClass(implicit ctx: Context) = defn.ScalaNumericValueClasses contains symbol
+    def isNumericValueClass(implicit ctx: Context) =
+      maybeOwner == defn.ScalaPackageClass && defn.ScalaNumericValueClasses().contains(symbol)
 
     /** Is symbol a phantom class for which no runtime representation exists? */
     def isPhantomClass(implicit ctx: Context) = defn.PhantomClasses contains symbol
@@ -434,7 +445,7 @@ object SymDenotations {
 
     /** is this symbol a trait representing a type lambda? */
     final def isLambdaTrait(implicit ctx: Context): Boolean =
-      isClass && name.startsWith(tpnme.LambdaPrefix)
+      isClass && name.startsWith(tpnme.hkLambdaPrefix) && owner == defn.ScalaPackageClass
 
     /** Is this symbol a package object or its module class? */
     def isPackageObject(implicit ctx: Context): Boolean = {
@@ -1199,10 +1210,20 @@ object SymDenotations {
 
     /** The denotation is fully completed: all attributes are fully defined.
      *  ClassDenotations compiled from source are first completed, then fully completed.
+     *  Packages are never fully completed since members can be added at any time.
      *  @see Namer#ClassCompleter
      */
-    private def isFullyCompleted(implicit ctx: Context): Boolean =
-      isCompleted && classParents.nonEmpty
+    private def isFullyCompleted(implicit ctx: Context): Boolean = {
+      def isFullyCompletedRef(tp: TypeRef) = tp.denot match {
+        case d: ClassDenotation => d.isFullyCompleted
+        case _ => false
+      }
+      def testFullyCompleted =
+        if (classParents.isEmpty) !is(Package) && symbol.eq(defn.AnyClass)
+        else classParents.forall(isFullyCompletedRef)
+      flagsUNSAFE.is(FullyCompleted) ||
+        isCompleted && testFullyCompleted && { setFlag(FullyCompleted); true }
+    }
 
     // ------ syncing inheritance-related info -----------------------------
 
@@ -1288,7 +1309,7 @@ object SymDenotations {
         baseTypeRefValid = ctx.runId
       }
 
-    private def computeBases(implicit ctx: Context): Unit = {
+    private def computeBases(implicit ctx: Context): (List[ClassSymbol], BitSet) = {
       if (myBaseClasses eq Nil) throw CyclicReference(this)
       myBaseClasses = Nil
       val seen = new mutable.BitSet
@@ -1312,8 +1333,14 @@ object SymDenotations {
         case nil =>
           to
       }
-      myBaseClasses = classSymbol :: addParentBaseClasses(classParents, Nil)
-      mySuperClassBits = seen.toImmutable
+      val bcs = classSymbol :: addParentBaseClasses(classParents, Nil)
+      val scbits = seen.toImmutable
+      if (isFullyCompleted) {
+        myBaseClasses = bcs
+        mySuperClassBits = scbits
+      }
+      else myBaseClasses = null
+      (bcs, scbits)
     }
 
     /** A bitset that contains the superId's of all base classes */
@@ -1321,8 +1348,7 @@ object SymDenotations {
       if (classParents.isEmpty) BitSet() // can happen when called too early in Namers
       else {
         checkBasesUpToDate()
-        if (mySuperClassBits == null) computeBases
-        mySuperClassBits
+        if (mySuperClassBits != null) mySuperClassBits else computeBases._2
       }
 
     /** The base classes of this class in linearization order,
@@ -1332,8 +1358,7 @@ object SymDenotations {
       if (classParents.isEmpty) classSymbol :: Nil // can happen when called too early in Namers
       else {
         checkBasesUpToDate()
-        if (myBaseClasses == null) computeBases
-        myBaseClasses
+        if (myBaseClasses != null) myBaseClasses else computeBases._1
       }
 
     final override def derivesFrom(base: Symbol)(implicit ctx: Context): Boolean =
@@ -1366,9 +1391,9 @@ object SymDenotations {
       while (ps.nonEmpty) {
         val parent = ps.head.typeSymbol
         parent.denot match {
-          case classd: ClassDenotation =>
-            fp.include(classd.memberFingerPrint)
-            parent.denot.setFlag(Frozen)
+          case parentDenot: ClassDenotation =>
+            fp.include(parentDenot.memberFingerPrint)
+            if (parentDenot.isFullyCompleted) parentDenot.setFlag(Frozen)
           case _ =>
         }
         ps = ps.tail
@@ -1381,10 +1406,13 @@ object SymDenotations {
      *  not be used for package classes because cache never
      *  gets invalidated.
      */
-    def memberFingerPrint(implicit ctx: Context): FingerPrint = {
-      if (myMemberFingerPrint == FingerPrint.unknown) myMemberFingerPrint = computeMemberFingerPrint
-      myMemberFingerPrint
-    }
+    def memberFingerPrint(implicit ctx: Context): FingerPrint =
+      if (myMemberFingerPrint != FingerPrint.unknown) myMemberFingerPrint
+      else {
+        val fp = computeMemberFingerPrint
+        if (isFullyCompleted) myMemberFingerPrint = fp
+        fp
+      }
 
     private[this] var myMemberCache: LRUCache[Name, PreDenotation] = null
     private[this] var myMemberCachePeriod: Period = Nowhere
@@ -1458,10 +1486,8 @@ object SymDenotations {
     def delete(sym: Symbol)(implicit ctx: Context) = {
       require(!(this is Frozen))
       info.decls.openForMutations.unlink(sym)
-      if (myMemberFingerPrint != FingerPrint.unknown)
-        computeMemberFingerPrint
-      if (myMemberCache != null)
-        myMemberCache invalidate sym.name
+      myMemberFingerPrint = FingerPrint.unknown
+      if (myMemberCache != null) myMemberCache invalidate sym.name
     }
 
     /** All members of this class that have the given name.
@@ -1776,6 +1802,14 @@ object SymDenotations {
     def withModuleClass(moduleClassFn: Context => Symbol): this.type = { myModuleClassFn = moduleClassFn; this }
   }
 
+  /** A subclass of LazyTypes where type parameters can be completed independently of
+   *  the info.
+   */
+  abstract class TypeParamsCompleter extends LazyType {
+    /** The type parameters computed by the completer before completion has finished */
+    def completerTypeParams(sym: Symbol): List[TypeSymbol]
+  }
+
   val NoSymbolFn = (ctx: Context) => NoSymbol
 
   /** A missing completer */
@@ -1870,4 +1904,6 @@ object SymDenotations {
   }
 
   private val AccessorOrLabel = Accessor | Label
+
+  @sharable private var indent = 0 // for completions printing
 }

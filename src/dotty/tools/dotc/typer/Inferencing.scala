@@ -89,7 +89,7 @@ object Inferencing {
             val minimize =
               variance >= 0 && !(
                 force == ForceDegree.noBottom &&
-                isBottomType(ctx.typeComparer.approximation(tvar.origin, fromBelow = true)))
+                defn.isBottomType(ctx.typeComparer.approximation(tvar.origin, fromBelow = true)))
             if (minimize) instantiate(tvar, fromBelow = true)
             else toMaximize = true
           }
@@ -173,13 +173,10 @@ object Inferencing {
     approxAbove - approxBelow
   }
 
-  def isBottomType(tp: Type)(implicit ctx: Context) =
-    tp == defn.NothingType || tp == defn.NullType
-
   /** Recursively widen and also follow type declarations and type aliases. */
   def widenForMatchSelector(tp: Type)(implicit ctx: Context): Type = tp.widen match {
     case tp: TypeRef if !tp.symbol.isClass => widenForMatchSelector(tp.info.bounds.hi)
-    case tp: AnnotatedType => tp.derivedAnnotatedType(tp.annot, widenForMatchSelector(tp.tpe))
+    case tp: AnnotatedType => tp.derivedAnnotatedType(widenForMatchSelector(tp.tpe), tp.annot)
     case tp => tp
   }
 

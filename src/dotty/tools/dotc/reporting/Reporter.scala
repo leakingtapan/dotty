@@ -66,6 +66,9 @@ object Reporter {
   class DeprecationWarning(msgFn: => String, pos: SourcePosition) extends ConditionalWarning(msgFn, pos) {
     def enablingOption(implicit ctx: Context) = ctx.settings.deprecation
   }
+  class MigrationWarning(msgFn: => String, pos: SourcePosition) extends ConditionalWarning(msgFn, pos) {
+    def enablingOption(implicit ctx: Context) = ctx.settings.migration
+  }
 }
 
 import Reporter._
@@ -81,6 +84,9 @@ trait Reporting { this: Context =>
 
   def deprecationWarning(msg: => String, pos: SourcePosition = NoSourcePosition): Unit =
     reporter.report(new DeprecationWarning(msg, pos))
+
+  def migrationWarning(msg: => String, pos: SourcePosition = NoSourcePosition): Unit =
+    reporter.report(new MigrationWarning(msg, pos))
 
   def uncheckedWarning(msg: => String, pos: SourcePosition = NoSourcePosition): Unit =
     reporter.report(new UncheckedWarning(msg, pos))
@@ -146,7 +152,12 @@ trait Reporting { this: Context =>
       case _ => String.valueOf(res)
     }
     if (printer eq config.Printers.noPrinter) op
-    else traceIndented[T](s"==> $question?", (res: Any) => s"<== $question = ${resStr(res)}")(op)
+    else {
+      // Avoid evaluating question multiple time, since each evaluation
+      // may cause some extra logging output.
+      lazy val q: String = question
+      traceIndented[T](s"==> $q?", (res: Any) => s"<== $q = ${resStr(res)}")(op)
+    }
   }
 
   def traceIndented[T](leading: => String, trailing: Any => String)(op: => T): T =

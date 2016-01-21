@@ -12,6 +12,7 @@ import util.{Stats, DotClass, SimpleMap}
 import config.Config
 import config.Printers._
 import TypeErasure.{erasedLub, erasedGlb}
+import TypeApplications._
 import scala.util.control.NonFatal
 
 /** Provides methods to compare types.
@@ -123,7 +124,7 @@ class TypeComparer(initctx: Context) extends DotClass with ConstraintHandling {
       pendingSubTypes = new mutable.HashSet[(Type, Type)]
       ctx.log(s"!!! deep subtype recursion involving ${tp1.show} <:< ${tp2.show}, constraint = ${state.constraint.show}")
       ctx.log(s"!!! constraint = ${constraint.show}")
-      if (ctx.settings.YnoDeepSubtypes.value) throw new Error("deep subtype")
+      assert(!ctx.settings.YnoDeepSubtypes.value) //throw new Error("deep subtype")
       if (Config.traceDeepSubTypeRecursions && !this.isInstanceOf[ExplainingTypeComparer])
         ctx.log(TypeComparer.explained(implicit ctx => ctx.typeComparer.isSubType(tp1, tp2)))
     }
@@ -140,37 +141,51 @@ class TypeComparer(initctx: Context) extends DotClass with ConstraintHandling {
 
   private def firstTry(tp1: Type, tp2: Type): Boolean = tp2 match {
     case tp2: NamedType =>
-      def compareAlias(info1: Type) = tp2.info match {
-        case info2: TypeAlias => isSubType(tp1, info2.alias)
-        case _ => info1 match {
-          case info1: TypeAlias => isSubType(info1.alias, tp2)
-          case NoType => secondTry(tp1, tp2)
-          case _ => thirdTryNamed(tp1, tp2)
+      def compareNamed(tp1: Type, tp2: NamedType): Boolean = {
+        implicit val ctx: Context = this.ctx
+        tp2.info match {
+          case info2: TypeAlias => isSubType(tp1, info2.alias)
+          case _ => tp1 match {
+            case tp1: NamedType =>
+              tp1.info match {
+                case info1: TypeAlias =>
+                  if (isSubType(info1.alias, tp2)) return true
+                  if (tp1.prefix.isStable) return false
+                    // If tp1.prefix is stable, the alias does contain all information about the original ref, so
+                    // there's no need to try something else. (This is important for performance).
+                    // To see why we cannot in general stop here, consider:
+                    //
+                    //     trait C { type A }
+                    //     trait D { type A = String }
+                    //     (C & D)#A <: C#A
+                    //
+                    // Following the alias leads to the judgment `String <: C#A` which is false.
+                    // However the original judgment should be true.
+                case _ =>
+              }
+              val sym1 = tp1.symbol
+              if ((sym1 ne NoSymbol) && (sym1 eq tp2.symbol))
+                ctx.erasedTypes ||
+                sym1.isStaticOwner ||
+                isSubType(tp1.prefix, tp2.prefix) ||
+                thirdTryNamed(tp1, tp2)
+              else
+                (  (tp1.name eq tp2.name)
+                && isSubType(tp1.prefix, tp2.prefix)
+                && tp1.signature == tp2.signature
+                && !tp1.isInstanceOf[WithFixedSym]
+                && !tp2.isInstanceOf[WithFixedSym]
+                ) ||
+                compareHkApply(tp1, tp2, inOrder = true) ||
+                compareHkApply(tp2, tp1, inOrder = false) ||
+                thirdTryNamed(tp1, tp2)
+            case _ =>
+              compareHkApply(tp2, tp1, inOrder = false) ||
+              secondTry(tp1, tp2)
+          }
         }
       }
-      def compareNamed = {
-        implicit val ctx: Context = this.ctx // Dotty deviation: implicits need explicit type
-        tp1 match {
-          case tp1: NamedType =>
-            val sym1 = tp1.symbol
-            (if ((sym1 ne NoSymbol) && (sym1 eq tp2.symbol))
-               ctx.erasedTypes || sym1.isStaticOwner || isSubType(tp1.prefix, tp2.prefix)
-            else
-              (tp1.name eq tp2.name) &&
-              isSubType(tp1.prefix, tp2.prefix) &&
-              (tp1.signature == tp2.signature) &&
-              !tp1.isInstanceOf[WithFixedSym] &&
-              !tp2.isInstanceOf[WithFixedSym]
-            ) ||
-            compareHK(tp1, tp2, inOrder = true) ||
-            compareHK(tp2, tp1, inOrder = false) ||
-            compareAlias(tp1.info)
-          case _ =>
-            compareHK(tp2, tp1, inOrder = false) ||
-            compareAlias(NoType)
-        }
-      }
-      compareNamed
+      compareNamed(tp1, tp2)
     case tp2: ProtoType =>
       isMatchedByProto(tp2, tp1)
     case tp2: BoundType =>
@@ -197,7 +212,7 @@ class TypeComparer(initctx: Context) extends DotClass with ConstraintHandling {
             val cls1 = tp1.cls
             cls1.classInfo.selfType.derivesFrom(cls2) &&
             cls2.classInfo.selfType.derivesFrom(cls1)
-          case tp1: TermRef if cls2.is(Module) && cls2.eq(tp1.widen.typeSymbol) =>
+          case tp1: NamedType if cls2.is(Module) && cls2.eq(tp1.widen.typeSymbol) =>
             cls2.isStaticOwner ||
             isSubType(tp1.prefix, cls2.owner.thisType) ||
             secondTry(tp1, tp2)
@@ -237,11 +252,13 @@ class TypeComparer(initctx: Context) extends DotClass with ConstraintHandling {
   private def secondTry(tp1: Type, tp2: Type): Boolean = tp1 match {
     case tp1: NamedType =>
       tp1.info match {
-        case info1: TypeAlias => isSubType(info1.alias, tp2)
-        case _ => compareHK(tp1, tp2, inOrder = true) || thirdTry(tp1, tp2)
-          // Note: If we change the order here, doing compareHK first and following aliases second,
-          // we get a -Ycheck error when compiling dotc/transform. Need to investigate.
+        case info1: TypeAlias =>
+          if (isSubType(info1.alias, tp2)) return true
+          if (tp1.prefix.isStable) return false
+        case _ =>
       }
+      compareHkApply(tp1, tp2, inOrder = true) ||
+      thirdTry(tp1, tp2)
     case tp1: PolyParam =>
       def flagNothingBound = {
         if (!frozenConstraint && tp2.isRef(defn.NothingClass) && state.isGlobalCommittable) {
@@ -330,20 +347,26 @@ class TypeComparer(initctx: Context) extends DotClass with ConstraintHandling {
         }
       comparePolyParam
     case tp2: RefinedType =>
+      def compareRefinedSlow: Boolean = {
+        val name2 = tp2.refinedName
+        isSubType(tp1, tp2.parent) &&
+          (name2 == nme.WILDCARD || hasMatchingMember(name2, tp1, tp2))
+      }
       def compareRefined: Boolean = {
         val tp1w = tp1.widen
         val skipped2 = skipMatching(tp1w, tp2)
-        if ((skipped2 eq tp2) || !Config.fastPathForRefinedSubtype) {
-          val name2 = tp2.refinedName
-          val normalPath =
-            isSubType(tp1, tp2.parent) &&
-              (  name2 == nme.WILDCARD
-              || hasMatchingMember(name2, tp1, tp2)
-              || fourthTry(tp1, tp2)
-              )
-          normalPath ||
-            needsEtaLift(tp1, tp2) && tp1.testLifted(tp2.typeParams, isSubType(_, tp2), classBounds(tp2))
-        }
+        if ((skipped2 eq tp2) || !Config.fastPathForRefinedSubtype)
+          tp1 match {
+            case tp1: AndType =>
+              // Delay calling `compareRefinedSlow` because looking up a member
+              // of an `AndType` can lead to a cascade of subtyping checks
+              // This twist is needed to make collection/generic/ParFactory.scala compile
+              fourthTry(tp1, tp2) || compareRefinedSlow
+            case _ =>
+              compareRefinedSlow ||
+              fourthTry(tp1, tp2) ||
+              compareHkLambda(tp2, tp1, inOrder = false)
+          }
         else // fast path, in particular for refinements resulting from parameterization.
           isSubType(tp1, skipped2) &&
           isSubRefinements(tp1w.asInstanceOf[RefinedType], tp2, skipped2)
@@ -405,8 +428,7 @@ class TypeComparer(initctx: Context) extends DotClass with ConstraintHandling {
           (tp2.variance > 0 && tp1.variance >= 0 || (lo2 eq NothingType) || isSubType(lo2, lo1)) &&
           (tp2.variance < 0 && tp1.variance <= 0 || (hi2 eq AnyType) || isSubType(hi1, hi2))
         case tp1: ClassInfo =>
-          val tt = tp1.typeRef
-          isSubType(lo2, tt) && isSubType(tt, hi2)
+          tp2 contains tp1
         case _ =>
           false
       }
@@ -463,8 +485,7 @@ class TypeComparer(initctx: Context) extends DotClass with ConstraintHandling {
       }
       isNewSubType(tp1.underlying.widenExpr, tp2) || comparePaths
     case tp1: RefinedType =>
-       isNewSubType(tp1.parent, tp2) ||
-         needsEtaLift(tp2, tp1) && tp2.testLifted(tp1.typeParams, isSubType(tp1, _), Nil)
+      isNewSubType(tp1.parent, tp2) || compareHkLambda(tp1, tp2, inOrder = true)
     case AndType(tp11, tp12) =>
       // Rewrite (T111 | T112) & T12 <: T2 to (T111 & T12) <: T2 and (T112 | T12) <: T2
       // and analogously for T11 & (T121 | T122) & T12 <: T2
@@ -488,23 +509,104 @@ class TypeComparer(initctx: Context) extends DotClass with ConstraintHandling {
         case _ => tp2 isRef ObjectClass
       }
       compareJavaArray
+    case tp1: ExprType if ctx.phase.id > ctx.gettersPhase.id =>
+      // getters might have converted T to => T, need to compensate.
+      isSubType(tp1.widenExpr, tp2)
     case _ =>
       false
   }
 
-  /** If `projection` is a hk projection T#$apply
-   *  and `other` is not a hk projection, then convert `other` to a hk projection `U`, and
-   *  continue with `T <:< U` if `inOrder` is true and `U <:< T` otherwise.
+  /** Test whether `tp1` has a base type of the form `B[T1, ..., Tn]` where
+   *   - `B` derives from one of the class symbols of `tp2`,
+   *   - the type parameters of `B` match one-by-one the variances of `tparams`,
+   *   - `B` satisfies predicate `p`.
    */
-  def compareHK(projection: NamedType, other: Type, inOrder: Boolean) =
-    projection.name == tpnme.hkApply &&
-    !other.isHKApply &&
-    other.testLifted(projection.prefix.LambdaClass(forcing = true).typeParams,
-      if (inOrder) isSubType(projection.prefix, _) else isSubType(_, projection.prefix),
-      if (inOrder) Nil else classBounds(projection.prefix))
+  private def testLifted(tp1: Type, tp2: Type, tparams: List[TypeSymbol], p: Type => Boolean): Boolean = {
+    val classBounds = tp2.member(tpnme.hkApply).info.classSymbols
+    def recur(bcs: List[ClassSymbol]): Boolean = bcs match {
+      case bc :: bcs1 =>
+        val baseRef = tp1.baseTypeRef(bc)
+        (classBounds.exists(bc.derivesFrom) &&
+         variancesConform(baseRef.typeParams, tparams) &&
+         p(baseRef.appliedTo(tp1.baseArgInfos(bc)))
+         ||
+         recur(bcs1))
+      case nil =>
+        false
+    }
+    recur(tp1.baseClasses)
+  }
 
-  /** The class symbols bounding the type of the `Apply` member of `tp` */
-  private def classBounds(tp: Type) = tp.member(tpnme.hkApply).info.classSymbols
+  /** If `projection` is a hk projection T#$apply with a constrainable poly param
+   *  as type constructor and `other` is not a hk projection, then perform the following
+   *  steps:
+   *
+   *   (1) If not `inOrder` then perform the next steps until they all succeed
+   *       for each base type of other which
+   *        - derives from a class bound of `projection`,
+   *        - has the same number of type parameters than `projection`
+   *        - has type parameter variances which conform to those of `projection`.
+   *       If `inOrder` then perform the same steps on the original `other` type.
+   *
+   *   (2) Try to eta expand the constructor of `other`.
+   *
+   *   (3a) In mode `TypevarsMissConetxt` replace the projection's hk constructor parameter
+   *        by the eta expansion of step (2) reapplied to the projection's arguments.
+   *   (3b) In normal mode, try to unify the projection's hk constructor parameter with
+   *        the eta expansion of step(2)
+   *
+   *   (4) If `inOrder`, test `projection <: other` else test `other <: projection`.
+   */
+  def compareHkApply(projection: NamedType, other: Type, inOrder: Boolean): Boolean = {
+    def tryInfer(tp: Type): Boolean = ctx.traceIndented(i"compareHK($projection, $other, inOrder = $inOrder, constr = $tp)", subtyping) {
+      tp match {
+        case tp: TypeVar => tryInfer(tp.underlying)
+        case param: PolyParam if canConstrain(param) =>
+
+          def unifyWith(liftedOther: Type): Boolean = {
+            subtyping.println(i"unify with $liftedOther")
+            liftedOther.typeConstructor.widen match {
+              case tycon: TypeRef if tycon.isEtaExpandable && tycon.typeParams.nonEmpty =>
+                val (ok, projection1) =
+                  if (ctx.mode.is(Mode.TypevarsMissContext))
+                    (true, EtaExpansion(tycon).appliedTo(projection.argInfos))
+                  else
+                    (tryInstantiate(param, EtaExpansion(tycon)), projection)
+                ok &&
+                (if (inOrder) isSubType(projection1, other) else isSubType(other, projection1))
+              case _ =>
+                false
+            }
+          }
+          val hkTypeParams = param.typeParams
+          subtyping.println(i"classBounds = ${projection.prefix.member(tpnme.hkApply).info.classSymbols}")
+          subtyping.println(i"base classes = ${other.baseClasses}")
+          subtyping.println(i"type params = $hkTypeParams")
+          if (inOrder) unifyWith(other)
+          else testLifted(other, projection.prefix, hkTypeParams, unifyWith)
+        case _ =>
+          false
+      }
+    }
+    projection.name == tpnme.hkApply && !other.isHKApply &&
+    tryInfer(projection.prefix.typeConstructor.dealias)
+  }
+
+  /** Compare type lambda with non-lambda type. */
+  def compareHkLambda(rt: RefinedType, other: Type, inOrder: Boolean) = rt match {
+    case TypeLambda(vs, args, body) =>
+      other.isInstanceOf[TypeRef] &&
+      args.length == other.typeParams.length && {
+        val applied = other.appliedTo(argRefs(rt, args.length))
+        if (inOrder) isSubType(body, applied)
+        else body match {
+          case body: TypeBounds => body.contains(applied)
+          case _ => isSubType(applied, body)
+        }
+      }
+    case _ =>
+      false
+  }
 
   /** Returns true iff either `tp11 <:< tp21` or `tp12 <:< tp22`, trying at the same time
    *  to keep the constraint as wide as possible. Specifically, if
@@ -617,11 +719,19 @@ class TypeComparer(initctx: Context) extends DotClass with ConstraintHandling {
    *       Further, no refinement refers back to the refined type via a refined this.
    *  The precondition is established by `skipMatching`.
    */
-  private def isSubRefinements(tp1: RefinedType, tp2: RefinedType, limit: Type): Boolean =
-    isSubType(tp1.refinedInfo, tp2.refinedInfo) && (
+  private def isSubRefinements(tp1: RefinedType, tp2: RefinedType, limit: Type): Boolean = {
+    def hasSubRefinement(tp1: RefinedType, refine2: Type): Boolean = {
+      isSubType(tp1.refinedInfo, refine2) || {
+        // last effort: try to adapt variances of higher-kinded types if this is sound.
+        val adapted2 = refine2.adaptHkVariances(tp1.parent.member(tp1.refinedName).symbol.info)
+        adapted2.ne(refine2) && hasSubRefinement(tp1, adapted2)
+      }
+    }
+    hasSubRefinement(tp1, tp2.refinedInfo) && (
       (tp2.parent eq limit) ||
       isSubRefinements(
         tp1.parent.asInstanceOf[RefinedType], tp2.parent.asInstanceOf[RefinedType], limit))
+  }
 
   /** A type has been covered previously in subtype checking if it
    *  is some combination of TypeRefs that point to classes, where the
@@ -653,14 +763,6 @@ class TypeComparer(initctx: Context) extends DotClass with ConstraintHandling {
     case tp: TypeProxy => isCappable(tp.underlying)
     case tp: AndOrType => isCappable(tp.tp1) || isCappable(tp.tp2)
     case _ => false
-  }
-
-  /** Does `tp` need to be eta lifted to be comparable to `target`? */
-  private def needsEtaLift(tp: Type, target: RefinedType): Boolean = {
-    // if (tp.isLambda != tp.isHK) println(i"discrepancy for $tp, isLambda = ${tp.isLambda}, isHK = ${tp.isHK}")
-    val name = target.refinedName
-    (name.isLambdaArgName || (name eq tpnme.hkApply)) &&
-    tp.exists && !tp.isLambda // we do encounter Lambda classes without any arguments here
   }
 
   /** Narrow gadt.bounds for the type parameter referenced by `tr` to include
@@ -808,7 +910,7 @@ class TypeComparer(initctx: Context) extends DotClass with ConstraintHandling {
 
   /** The greatest lower bound of a list types */
   final def glb(tps: List[Type]): Type =
-    (defn.AnyType /: tps)(glb)
+    ((defn.AnyType: Type) /: tps)(glb)
 
   /** The least upper bound of two types
    *  @note  We do not admit singleton types in or-types as lubs.
@@ -837,7 +939,7 @@ class TypeComparer(initctx: Context) extends DotClass with ConstraintHandling {
 
   /** The least upper bound of a list of types */
   final def lub(tps: List[Type]): Type =
-    (defn.NothingType /: tps)(lub)
+    ((defn.NothingType: Type) /: tps)(lub)
 
   /** Merge `t1` into `tp2` if t1 is a subtype of some &-summand of tp2.
    */
@@ -904,12 +1006,7 @@ class TypeComparer(initctx: Context) extends DotClass with ConstraintHandling {
       val t2 = distributeAnd(tp2, tp1)
       if (t2.exists) t2
       else if (erased) erasedGlb(tp1, tp2, isJava = false)
-      else {
-        //if (isHKRef(tp1)) tp2
-        //else if (isHKRef(tp2)) tp1
-        //else
-        AndType(tp1, tp2)
-      }
+      else liftIfHK(tp1, tp2, AndType(_, _))
     }
   }
 
@@ -933,12 +1030,21 @@ class TypeComparer(initctx: Context) extends DotClass with ConstraintHandling {
       val t2 = distributeOr(tp2, tp1)
       if (t2.exists) t2
       else if (erased) erasedLub(tp1, tp2)
-      else
-        //if (isHKRef(tp1)) tp1
-        //else if (isHKRef(tp2)) tp2
-        //else
-        OrType(tp1, tp2)
+      else liftIfHK(tp1, tp2, OrType(_, _))
     }
+  }
+
+  /** `op(tp1, tp2)` unless `tp1` and `tp2` are type-constructors.
+   *  In the latter case, combine `tp1` and `tp2` under a type lambda like this:
+   *
+   *    [X1, ..., Xn] -> op(tp1[X1, ..., Xn], tp2[X1, ..., Xn])
+   */
+  private def liftIfHK(tp1: Type, tp2: Type, op: (Type, Type) => Type) = {
+    val tparams1 = tp1.typeParams
+    val tparams2 = tp2.typeParams
+    if (tparams1.isEmpty || tparams2.isEmpty) op(tp1, tp2)
+    else if (tparams1.length != tparams2.length) mergeConflict(tp1, tp2)
+    else hkCombine(tp1, tp2, tparams1, tparams2, op)
   }
 
   /** Try to distribute `&` inside type, detect and handle conflicts */
@@ -959,13 +1065,13 @@ class TypeComparer(initctx: Context) extends DotClass with ConstraintHandling {
     case tp1: TypeBounds =>
       tp2 match {
         case tp2: TypeBounds => tp1 & tp2
-        case tp2: ClassInfo if tp1 contains tp2.typeRef => tp2
+        case tp2: ClassInfo if tp1 contains tp2 => tp2
         case _ => mergeConflict(tp1, tp2)
       }
     case tp1: ClassInfo =>
       tp2 match {
         case tp2: ClassInfo if tp1.cls eq tp2.cls => tp1.derivedClassInfo(tp1.prefix & tp2.prefix)
-        case tp2: TypeBounds if tp2 contains tp1.typeRef => tp1
+        case tp2: TypeBounds if tp2 contains tp1 => tp1
         case _ => mergeConflict(tp1, tp2)
       }
     case tp1 @ MethodType(names1, formals1) =>
@@ -1003,28 +1109,25 @@ class TypeComparer(initctx: Context) extends DotClass with ConstraintHandling {
       NoType
   }
 
-  /** Try to distribute `|` inside type, detect and handle conflicts */
+  /** Try to distribute `|` inside type, detect and handle conflicts
+   *  Note that, unlike for `&`, a disjunction cannot be pushed into
+   *  a refined or applied type. Example:
+   *
+   *     List[T] | List[U] is not the same as List[T | U].
+   *
+   *  The rhs is a proper supertype of the lhs.
+   */
   private def distributeOr(tp1: Type, tp2: Type): Type = tp1 match {
-    case tp1: RefinedType =>
-      tp2 match {
-        case tp2: RefinedType if tp1.refinedName == tp2.refinedName =>
-          tp1.derivedRefinedType(
-              tp1.parent | tp2.parent,
-              tp1.refinedName,
-              tp1.refinedInfo | tp2.refinedInfo.substRefinedThis(tp2, RefinedThis(tp1)))
-        case _ =>
-          NoType
-      }
     case tp1: TypeBounds =>
       tp2 match {
         case tp2: TypeBounds => tp1 | tp2
-        case tp2: ClassInfo if tp1 contains tp2.typeRef => tp1
+        case tp2: ClassInfo if tp1 contains tp2 => tp1
         case _ => mergeConflict(tp1, tp2)
       }
     case tp1: ClassInfo =>
       tp2 match {
         case tp2: ClassInfo if tp1.cls eq tp2.cls => tp1.derivedClassInfo(tp1.prefix | tp2.prefix)
-        case tp2: TypeBounds if tp2 contains tp1.typeRef => tp2
+        case tp2: TypeBounds if tp2 contains tp1 => tp2
         case _ => mergeConflict(tp1, tp2)
       }
     case tp1 @ MethodType(names1, formals1) =>
@@ -1064,7 +1167,7 @@ class TypeComparer(initctx: Context) extends DotClass with ConstraintHandling {
       case bounds: TypeBounds => i"type bounds $bounds"
       case _ => tp.show
     }
-    throw new MergeError(s"cannot merge ${showType(tp1)} with ${showType(tp2)}")
+    throw new MergeError(s"cannot merge ${showType(tp1)} with ${showType(tp2)}", tp1, tp2)
   }
 
   /** Merge two lists of names. If names in corresponding positions match, keep them,
@@ -1134,7 +1237,7 @@ class TypeComparer(initctx: Context) extends DotClass with ConstraintHandling {
 
   /** Show subtype goal that led to an assertion failure */
   def showGoal(tp1: Type, tp2: Type)(implicit ctx: Context) = {
-    ctx.println(disambiguated(implicit ctx => s"assertion failure for ${tp1.show} <:< ${tp2.show}, frozen = $frozenConstraint"))
+    println(disambiguated(implicit ctx => s"assertion failure for ${tp1.show} <:< ${tp2.show}, frozen = $frozenConstraint"))
     def explainPoly(tp: Type) = tp match {
       case tp: PolyParam => ctx.println(s"polyparam ${tp.show} found in ${tp.binder.show}")
       case tp: TypeRef if tp.symbol.exists => ctx.println(s"typeref ${tp.show} found in ${tp.symbol.owner.show}")
@@ -1222,12 +1325,19 @@ class ExplainingTypeComparer(initctx: Context) extends TypeComparer(initctx) {
 
   override def copyIn(ctx: Context) = new ExplainingTypeComparer(ctx)
 
-  override def compareHK(projection: NamedType, other: Type, inOrder: Boolean) =
+  override def compareHkApply(projection: NamedType, other: Type, inOrder: Boolean) =
     if (projection.name == tpnme.hkApply)
-      traceIndented(i"compareHK $projection, $other, $inOrder") {
-        super.compareHK(projection, other, inOrder)
+      traceIndented(i"compareHkApply $projection, $other, $inOrder") {
+        super.compareHkApply(projection, other, inOrder)
       }
-    else super.compareHK(projection, other, inOrder)
+    else super.compareHkApply(projection, other, inOrder)
+
+  override def compareHkLambda(rt: RefinedType, other: Type, inOrder: Boolean) =
+    if (rt.refinedName == tpnme.hkApply)
+      traceIndented(i"compareHkLambda $rt, $other, $inOrder") {
+        super.compareHkLambda(rt, other, inOrder)
+      }
+    else super.compareHkLambda(rt, other, inOrder)
 
   override def toString = "Subtype trace:" + { try b.toString finally b.clear() }
 }

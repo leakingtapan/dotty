@@ -207,14 +207,20 @@ object Denotations {
 
     def requiredMethod(name: PreName)(implicit ctx: Context): TermSymbol =
       info.member(name.toTermName).requiredSymbol(_ is Method).asTerm
+    def requiredMethodRef(name: PreName)(implicit ctx: Context): TermRef =
+      requiredMethod(name).termRef
 
     def requiredMethod(name: PreName, argTypes: List[Type])(implicit ctx: Context): TermSymbol =
       info.member(name.toTermName).requiredSymbol(x=>
         (x is Method) && x.info.paramTypess == List(argTypes)
       ).asTerm
+    def requiredMethodRef(name: PreName, argTypes: List[Type])(implicit ctx: Context): TermRef =
+      requiredMethod(name, argTypes).termRef
 
     def requiredValue(name: PreName)(implicit ctx: Context): TermSymbol =
       info.member(name.toTermName).requiredSymbol(_.info.isParameterless).asTerm
+    def requiredValueRef(name: PreName)(implicit ctx: Context): TermRef =
+      requiredValue(name).termRef
 
     def requiredClass(name: PreName)(implicit ctx: Context): ClassSymbol =
       info.member(name.toTypeName).requiredSymbol(_.isClass).asClass
@@ -253,11 +259,12 @@ object Denotations {
      *
      *  If there is no preferred accessible denotation, return a JointRefDenotation
      *  with one of the operand symbols (unspecified which one), and an info which
-     *  is intersection (&) of the infos of the operand denotations.
+     *  is the intersection (using `&` or `safe_&` if `safeIntersection` is true)
+     *  of the infos of the operand denotations.
      *
      *  If SingleDenotations with different signatures are joined, return NoDenotation.
      */
-    def & (that: Denotation, pre: Type)(implicit ctx: Context): Denotation = {
+    def & (that: Denotation, pre: Type, safeIntersection: Boolean = false)(implicit ctx: Context): Denotation = {
 
       /** Try to merge denot1 and denot2 without adding a new signature. */
       def mergeDenot(denot1: Denotation, denot2: SingleDenotation): Denotation = denot1 match {
@@ -311,14 +318,18 @@ object Denotations {
                   else if (preferSym(sym2, sym1)) sym2
                   else sym1
                 val jointInfo =
-                  try info1 & info2
+                  try
+                    if (safeIntersection)
+                      info1 safe_& info2
+                    else
+                      info1 & info2
                   catch {
                     case ex: MergeError =>
-                      if (pre.widen.classSymbol.is(Scala2x))
+                      if (pre.widen.classSymbol.is(Scala2x) || ctx.scala2Mode)
                         info1 // follow Scala2 linearization -
                               // compare with way merge is performed in SymDenotation#computeMembersNamed
                       else
-                        throw new MergeError(s"${ex.getMessage} as members of type ${pre.show}")
+                        throw new MergeError(s"${ex.getMessage} as members of type ${pre.show}", ex.tp1, ex.tp2)
                   }
                 new JointRefDenotation(sym, jointInfo, denot1.validFor & denot2.validFor)
               }

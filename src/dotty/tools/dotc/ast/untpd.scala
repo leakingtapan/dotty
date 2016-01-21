@@ -201,7 +201,9 @@ object untpd extends Trees.Instance[Untyped] with UntypedTreeInfo {
   def ref(tp: NamedType)(implicit ctx: Context): Tree =
     TypedSplice(tpd.ref(tp))
 
-  def scalaUnit(implicit ctx: Context) = ref(defn.UnitClass.typeRef)
+  def rootDot(name: Name) = Select(Ident(nme.ROOTPKG), name)
+  def scalaDot(name: Name) = Select(rootDot(nme.scala_), name)
+  def scalaUnit = scalaDot(tpnme.Unit)
 
   def makeConstructor(tparams: List[TypeDef], vparamss: List[List[ValDef]], rhs: Tree = EmptyTree)(implicit ctx: Context): DefDef =
     DefDef(nme.CONSTRUCTOR, tparams, vparamss, TypeTree(), rhs)
@@ -232,11 +234,12 @@ object untpd extends Trees.Instance[Untyped] with UntypedTreeInfo {
    *  parameter, the reference will be a repeated argument.
    */
   def refOfDef(tree: MemberDef)(implicit ctx: Context) = tree match {
-    case ValDef(_, PostfixOp(_, nme.raw.STAR), _) =>
-      Typed(Ident(tree.name), Ident(tpnme.WILDCARD_STAR))
-    case _ =>
-      Ident(tree.name)
+    case ValDef(_, PostfixOp(_, nme.raw.STAR), _) => repeated(Ident(tree.name))
+    case _ => Ident(tree.name)
   }
+
+  /** A repeated argument such as `arg: _*` */
+  def repeated(arg: Tree)(implicit ctx: Context) = Typed(arg, Ident(tpnme.WILDCARD_STAR))
 
 // ------- Decorators -------------------------------------------------
 

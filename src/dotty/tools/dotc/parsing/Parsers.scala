@@ -259,7 +259,11 @@ object Parsers {
     }
 
     /** Cannot use ctx.featureEnabled because accessing the context would force too much */
-    private def scala2mode = ctx.settings.language.value.contains(nme.Scala2.toString)
+    private def testScala2Mode(msg: String, pos: Position = Position(in.offset)) = {
+      val s2 = ctx.settings.language.value.contains(nme.Scala2.toString)
+      if (s2) ctx.migrationWarning(msg, source atPos pos)
+      s2
+    }
 
 /* ---------- TREE CONSTRUCTION ------------------------------------------- */
 
@@ -1152,7 +1156,8 @@ object Parsers {
      */
     def block(): Tree = {
       val stats = blockStatSeq()
-      if (stats.nonEmpty && !stats.last.isDef) Block(stats.init, stats.last)
+      def isExpr(stat: Tree) = !(stat.isDef || stat.isInstanceOf[Import])
+      if (stats.nonEmpty && isExpr(stats.last)) Block(stats.init, stats.last)
       else Block(stats, EmptyTree)
     }
 
@@ -1726,12 +1731,13 @@ object Parsers {
      *  DefSig ::= id [DefTypeParamClause] ParamClauses
      */
     def defDefOrDcl(mods: Modifiers): Tree = atPos(tokenRange) {
-      def atScala2Brace = scala2mode && in.token == LBRACE
+      def scala2ProcedureSyntax =
+        testScala2Mode("Procedure syntax no longer supported; `: Unit =' should be inserted here")
       if (in.token == THIS) {
         in.nextToken()
         val vparamss = paramClauses(nme.CONSTRUCTOR)
         val rhs = {
-          if (!atScala2Brace) accept(EQUALS)
+          if (!(in.token == LBRACE && scala2ProcedureSyntax)) accept(EQUALS)
           atPos(in.offset) { constrExpr() }
         }
         makeConstructor(Nil, vparamss, rhs).withMods(mods)
@@ -1748,7 +1754,7 @@ object Parsers {
           }
           else if (!tpt.isEmpty)
             EmptyTree
-          else if (scala2mode) {
+          else if (scala2ProcedureSyntax) {
             tpt = scalaUnit
             if (in.token == LBRACE) expr()
             else EmptyTree

@@ -7,7 +7,7 @@ import org.junit.experimental.categories._
 
 import scala.io.Source
 
-
+// tests that match regex '(pos|dotc|run|java|compileStdLib)\.*' would be executed as benchmarks.
 class tests extends CompilerTest {
 
   def isRunByJenkins: Boolean = sys.props.isDefinedAt("dotty.jenkins.build")
@@ -25,7 +25,7 @@ class tests extends CompilerTest {
   implicit val defaultOptions = noCheckOptions ++ List(
       "-Yno-deep-subtypes", "-Yno-double-bindings",
       "-d", defaultOutputDir) ++ {
-    if (isRunByJenkins) List("-Ycheck:-Ycheck:tailrec,resolveSuper,mixin,restoreScopes,labelDef") // should be Ycheck:all, but #725
+    if (isRunByJenkins) List("-Ycheck:tailrec,resolveSuper,mixin,restoreScopes,labelDef") // should be Ycheck:all, but #725
     else List("-Ycheck:tailrec,resolveSuper,mixin,restoreScopes,labelDef")
   }
 
@@ -51,6 +51,7 @@ class tests extends CompilerTest {
   val toolsDir  = dottyDir + "tools/"
   val dotcDir   = toolsDir + "dotc/"
   val coreDir   = dotcDir + "core/"
+  val typerDir  = dotcDir + "typer/"
 
   @Test def pickle_pickleOK = compileDir(testsDir, "pickling", testPickling)
 // This directory doesn't exist anymore
@@ -100,14 +101,15 @@ class tests extends CompilerTest {
 
   @Test def pos_all = compileFiles(posDir) // twice omitted to make tests run faster
 
-  @Test def pos_t2613 = compileFile(posSpecialDir, "t2613")(allowDeepSubtypes)
   @Test def pos_i871 = compileFile(posSpecialDir, "i871", scala2mode)
+  @Test def pos_variancesConstr = compileFile(posSpecialDir, "variances-constr", scala2mode)
 
   @Test def new_all = compileFiles(newDir, twice)
 
   @Test def neg_abstractOverride() = compileFile(negDir, "abstract-override", xerrors = 2)
   @Test def neg_blockescapes() = compileFile(negDir, "blockescapesNeg", xerrors = 1)
-  @Test def neg_typedapply() = compileFile(negDir, "typedapply", xerrors = 4)
+  @Test def neg_bounds() = compileFile(negDir, "bounds", xerrors = 3)
+  @Test def neg_typedapply() = compileFile(negDir, "typedapply", xerrors = 3)
   @Test def neg_typedIdents() = compileDir(negDir, "typedIdents", xerrors = 2)
   @Test def neg_assignments() = compileFile(negDir, "assignments", xerrors = 3)
   @Test def neg_typers() = compileFile(negDir, "typers", xerrors = 14)(allowDoubleBindings)
@@ -118,7 +120,8 @@ class tests extends CompilerTest {
   @Test def neg_autoTupling2 = compileFile(negDir, "autoTuplingTest", xerrors = 3)
   @Test def neg_companions = compileFile(negDir, "companions", xerrors = 1)
   @Test def neg_over = compileFile(negDir, "over", xerrors = 3)
-  @Test def neg_overrides = compileFile(negDir, "overrides", xerrors = 11)
+  @Test def neg_overrides = compileFile(negDir, "overrides", xerrors = 12)
+  @Test def neg_overrideClass = compileFile(negDir, "overrideClass", List("-language:Scala2"), xerrors = 1)
   @Test def neg_i39 = compileFile(negDir, "i39", xerrors = 2)
   @Test def neg_i50_volatile = compileFile(negDir, "i50-volatile", xerrors = 6)
   @Test def neg_zoo = compileFile(negDir, "zoo", xerrors = 12)
@@ -131,34 +134,40 @@ class tests extends CompilerTest {
   @Test def neg_tailcall2 = compileFile(negTailcallDir, "tailrec-2", xerrors = 2)
   @Test def neg_tailcall3 = compileFile(negTailcallDir, "tailrec-3", xerrors = 2)
 
-  @Test def neg_t1279a = compileFile(negDir, "t1279a", xerrors = 1)
   @Test def neg_t1843_variances = compileFile(negDir, "t1843-variances", xerrors = 1)
   @Test def neg_t2660_ambi = compileFile(negDir, "t2660", xerrors = 2)
   @Test def neg_t2994 = compileFile(negDir, "t2994", xerrors = 2)
   @Test def neg_subtyping = compileFile(negDir, "subtyping", xerrors = 5)
   @Test def neg_variances = compileFile(negDir, "variances", xerrors = 2)
+  @Test def neg_variancesConstr = compileFile(negDir, "variances-constr", xerrors = 2)
   @Test def neg_i871_missingReturnType = compileFile(negDir, "i871", xerrors = 2)
   @Test def neg_badAuxConstr = compileFile(negDir, "badAuxConstr", xerrors = 2)
   @Test def neg_typetest = compileFile(negDir, "typetest", xerrors = 1)
   @Test def neg_t1569_failedAvoid = compileFile(negDir, "t1569-failedAvoid", xerrors = 1)
-  @Test def neg_clashes = compileFile(negDir, "clashes", xerrors = 3)
+  @Test def neg_clashes = compileFile(negDir, "clashes", xerrors = 2)
   @Test def neg_cycles = compileFile(negDir, "cycles", xerrors = 8)
   @Test def neg_boundspropagation = compileFile(negDir, "boundspropagation", xerrors = 5)
   @Test def neg_refinedSubtyping = compileFile(negDir, "refinedSubtyping", xerrors = 2)
+  @Test def neg_hklower = compileFile(negDir, "hklower", xerrors = 3)
+  @Test def neg_Iter2 = compileFile(negDir, "Iter2", xerrors = 2)
   @Test def neg_i0091_infpaths = compileFile(negDir, "i0091-infpaths", xerrors = 3)
   @Test def neg_i0248_inherit_refined = compileFile(negDir, "i0248-inherit-refined", xerrors = 4)
   @Test def neg_i0281 = compileFile(negDir, "i0281-null-primitive-conforms", xerrors = 3)
   @Test def neg_i583 = compileFile(negDir, "i0583-skolemize", xerrors = 2)
+  @Test def neg_i941 = compileFile(negDir, "i941", xerrors = 3)
   @Test def neg_finalSealed = compileFile(negDir, "final-sealed", xerrors = 2)
   @Test def neg_i705 = compileFile(negDir, "i705-inner-value-class", xerrors = 7)
   @Test def neg_i866 = compileFile(negDir, "i866", xerrors = 2)
+  @Test def neg_i974 = compileFile(negDir, "i974", xerrors = 2)
   @Test def neg_moduleSubtyping = compileFile(negDir, "moduleSubtyping", xerrors = 4)
   @Test def neg_escapingRefs = compileFile(negDir, "escapingRefs", xerrors = 2)
   @Test def neg_instantiateAbstract = compileFile(negDir, "instantiateAbstract", xerrors = 8)
+  @Test def neg_partialApplications = compileFile(negDir, "partialApplications", xerrors = 3)
   @Test def neg_selfInheritance = compileFile(negDir, "selfInheritance", xerrors = 6)
-  @Test def neg_selfreq = compileFile(negDir, "selfreq", xerrors = 3)
+  @Test def neg_selfreq = compileFile(negDir, "selfreq", xerrors = 2)
   @Test def neg_singletons = compileFile(negDir, "singletons", xerrors = 8)
   @Test def neg_shadowedImplicits = compileFile(negDir, "arrayclone-new", xerrors = 2)
+  @Test def neg_ski = compileFile(negDir, "ski", xerrors = 2)
   @Test def neg_traitParamsTyper = compileFile(negDir, "traitParamsTyper", xerrors = 5)
   @Test def neg_traitParamsMixin = compileFile(negDir, "traitParamsMixin", xerrors = 2)
   @Test def neg_firstError = compileFile(negDir, "firstError", xerrors = 3)
@@ -166,18 +175,29 @@ class tests extends CompilerTest {
   @Test def neg_validate = compileFile(negDir, "validate", xerrors = 18)
   @Test def neg_validateParsing = compileFile(negDir, "validate-parsing", xerrors = 7)
   @Test def neg_validateRefchecks = compileFile(negDir, "validate-refchecks", xerrors = 2)
+  @Test def neg_skolemize = compileFile(negDir, "skolemize", xerrors = 2)
+  @Test def neg_nested_bounds = compileFile(negDir, "nested_bounds", xerrors = 1)
 
   @Test def run_all = runFiles(runDir)
 
   val stdlibFiles = Source.fromFile("./test/dotc/scala-collections.whitelist", "UTF8").getLines()
    .map(_.trim) // allow identation
    .filter(!_.startsWith("#")) // allow comment lines prefixed by #
-   .map(_.takeWhile(_ != "#").trim) // allow comments in the end of line
+   .map(_.takeWhile(_ != '#').trim) // allow comments in the end of line
    .filter(_.nonEmpty)
    .toList
 
-  @Test def compileStdLib = compileList("compileStdLib", stdlibFiles)
-  @Test def dotty = compileDir(dottyDir, ".", "-deep" :: "-Ycheck-reentrant" :: allowDeepSubtypes) // note the -deep argument
+  @Test def compileStdLib = compileList("compileStdLib", stdlibFiles, "-migration" :: scala2mode)
+  @Test def compileMixed = compileLine(
+      """tests/pos/B.scala
+        |./scala-scala/src/library/scala/collection/immutable/Seq.scala
+        |./scala-scala/src/library/scala/package.scala
+        |./scala-scala/src/library/scala/collection/GenSeqLike.scala
+        |./scala-scala/src/library/scala/collection/SeqLike.scala
+        |./scala-scala/src/library/scala/collection/generic/GenSeqFactory.scala""".stripMargin)
+  @Test def compileIndexedSeq = compileLine("./scala-scala/src/library/scala/collection/immutable/IndexedSeq.scala")
+
+  @Test def dotty = compileDir(dottyDir, ".", List("-deep", "-Ycheck-reentrant"))(allowDeepSubtypes) // note the -deep argument
 
   @Test def dotc_ast = compileDir(dotcDir, "ast")
   @Test def dotc_config = compileDir(dotcDir, "config")
@@ -186,7 +206,7 @@ class tests extends CompilerTest {
 // This directory doesn't exist anymore
 //  @Test def dotc_core_pickling = compileDir(coreDir, "pickling")(allowDeepSubtypes)// twice omitted to make tests run faster
 
-  @Test def dotc_transform = compileDir(dotcDir, "transform")// twice omitted to make tests run faster
+  @Test def dotc_transform = compileDir(dotcDir, "transform")(allowDeepSubtypes)// twice omitted to make tests run faster
 
   @Test def dotc_parsing = compileDir(dotcDir, "parsing") // twice omitted to make tests run faster
 
@@ -221,4 +241,31 @@ class tests extends CompilerTest {
   val javaDir = "./tests/pos/java-interop/"
   @Test def java_all = compileFiles(javaDir, twice)
   //@Test def dotc_compilercommand = compileFile(dotcDir + "config/", "CompilerCommand")
+
+  @Test def tasty_new_all = compileFiles(newDir, testPickling)
+  @Test def tasty_dotc_config = compileDir(dotcDir, "config", testPickling)
+  @Test def tasty_dotc_printing = compileDir(dotcDir, "printing", testPickling)
+  //@Test def tasty_dotc_reporting = compileDir(dotcDir, "reporting", testPickling)
+  @Test def tasty_dotc_util = compileDir(dotcDir, "util", testPickling)
+  @Test def tasty_core = compileList("tasty_core", List(
+      "Annotations.scala", "Constants.scala", "Constraint.scala", "ConstraintHandling.scala",
+      "ConstraintRunInfo.scala", "Contexts.scala", "Decorators.scala", "Definitions.scala",
+      "DenotTransformers.scala", "Denotations.scala", "Flags.scala", "Hashable.scala",
+      "NameOps.scala", "Names.scala", "OrderingConstraint.scala", "Periods.scala",
+      "Phases.scala", "Scopes.scala", "Signature.scala", "StdNames.scala",
+      "Substituters.scala", "SymDenotations.scala", "SymbolLoaders.scala", "Symbols.scala",
+      "TypeApplications.scala", "TypeComparer.scala", "TypeErasure.scala", "TypeOps.scala",
+      "TyperState.scala", "Uniques.scala"
+    ) map (coreDir + _), testPickling)
+  @Test def tasty_typer = compileList("tasty_typer", List(
+      "Applications.scala", "Checking.scala", "ConstFold.scala", "ErrorReporting.scala",
+      "EtaExpansion.scala", "FrontEnd.scala", "Implicits.scala", "ImportInfo.scala",
+      "Inferencing.scala", "Mode.scala", "ProtoTypes.scala", "ReTyper.scala", "RefChecks.scala",
+      "TypeAssigner.scala", "Typer.scala", "VarianceChecker.scala", "Variances.scala"
+    ) map (typerDir + _), testPickling)
+  @Test def tasty_tasty = compileDir(coreDir, "tasty", testPickling)
+  @Test def tasty_classfile = compileDir(coreDir, "classfile", testPickling)
+  @Test def tasty_unpickleScala2 = compileDir(coreDir, "unpickleScala2", testPickling)
+  @Test def tasty_tools_io = compileDir(toolsDir, "io", testPickling)
+  @Test def tasty_tests = compileDir(testsDir, "tasty", testPickling)
 }

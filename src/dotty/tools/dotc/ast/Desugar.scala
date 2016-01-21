@@ -21,6 +21,13 @@ object desugar {
   /** Info of a variable in a pattern: The named tree and its type */
   private type VarInfo = (NameTree, Tree)
 
+  /** Names of methods that are added unconditionally to case classes */
+  def isDesugaredCaseClassMethodName(name: Name)(implicit ctx: Context) =
+    name == nme.isDefined ||
+    name == nme.copy ||
+    name == nme.productArity ||
+    name.isSelectorName
+
 // ----- DerivedTypeTrees -----------------------------------
 
   class SetterParamTree extends DerivedTypeTree {
@@ -323,7 +330,7 @@ object desugar {
 
     def anyRef = ref(defn.AnyRefAlias.typeRef)
     def productConstr(n: Int) = {
-      val tycon = ref(defn.ProductNClass(n).typeRef)
+      val tycon = scalaDot((tpnme.Product.toString + n).toTypeName)
       val targs = constrVparamss.head map (_.tpt)
       if (targs.isEmpty) tycon else AppliedTypeTree(tycon, targs)
     }
@@ -396,7 +403,8 @@ object desugar {
         // implicit wrapper is typechecked in same scope as constructor, so
         // we can reuse the constructor parameters; no derived params are needed.
         DefDef(name.toTermName, constrTparams, constrVparamss, classTypeRef, creatorExpr)
-          .withFlags(Synthetic | Implicit) :: Nil
+          .withFlags(Synthetic | Implicit)
+          .withPos(cdef.pos) :: Nil
 
 
     val self1 = {
@@ -517,6 +525,12 @@ object desugar {
       }
   }
 
+  /** Expand variable identifier x to x @ _ */
+  def patternVar(tree: Tree)(implicit ctx: Context) = {
+    val Ident(name) = tree
+    Bind(name, Ident(nme.WILDCARD)).withPos(tree.pos)
+  }
+
   def defTree(tree: Tree)(implicit ctx: Context): Tree = tree match {
     case tree: ValDef => valDef(tree)
     case tree: TypeDef => if (tree.isClassDef) classDef(tree) else typeDef(tree)
@@ -578,7 +592,7 @@ object desugar {
    *      tree @cls
    */
   def makeAnnotated(cls: Symbol, tree: Tree)(implicit ctx: Context) =
-    Annotated(TypedSplice(tpd.New(cls.typeRef, Nil)), tree)
+    Annotated(untpd.New(untpd.TypeTree(cls.typeRef), Nil), tree)
 
   private def derivedValDef(named: NameTree, tpt: Tree, rhs: Tree, mods: Modifiers) =
     ValDef(named.name.asTermName, tpt, rhs).withMods(mods).withPos(named.pos)
@@ -788,7 +802,7 @@ object desugar {
     tree match {
       case SymbolLit(str) =>
         Apply(
-          Select(ref(defn.SymbolClass.companionModule.termRef), nme.apply),
+          ref(defn.SymbolClass.companionModule.termRef),
           Literal(Constant(str)) :: Nil)
       case InterpolatedString(id, strs, elems) =>
         Apply(Select(Apply(Ident(nme.StringContext), strs), id), elems)
@@ -803,10 +817,10 @@ object desugar {
           makeBinop(l, op, r)
       case PostfixOp(t, op) =>
         if ((ctx.mode is Mode.Type) && op == nme.raw.STAR) {
-          val seqClass = if (ctx.compilationUnit.isJava) defn.ArrayClass else defn.SeqClass
+          val seqType = if (ctx.compilationUnit.isJava) defn.ArrayType else defn.SeqType
           Annotated(
-            New(ref(defn.RepeatedAnnot.typeRef), Nil :: Nil),
-            AppliedTypeTree(ref(seqClass.typeRef), t))
+            New(ref(defn.RepeatedAnnotType), Nil :: Nil),
+            AppliedTypeTree(ref(seqType), t))
         } else {
           assert(ctx.mode.isExpr || ctx.reporter.hasErrors, ctx.mode)
           Select(t, op)
@@ -818,22 +832,22 @@ object desugar {
       case Tuple(ts) =>
         if (unboxedPairs) {
           def PairTypeTree(l: Tree, r: Tree) =
-            AppliedTypeTree(ref(defn.PairClass.typeRef), l :: r :: Nil)
+            AppliedTypeTree(ref(defn.PairType), l :: r :: Nil)
           if (ctx.mode is Mode.Type) ts.reduceRight(PairTypeTree)
           else if (ts.isEmpty) unitLiteral
           else ts.reduceRight(Pair(_, _))
         }
         else {
           val arity = ts.length
-          def tupleClass = defn.TupleClass(arity)
+          def tupleTypeRef = defn.TupleType(arity)
           if (arity > Definitions.MaxTupleArity) {
             ctx.error(s"tuple too long (max allowed: ${Definitions.MaxTupleArity})", tree.pos)
             unitLiteral
           }
           else if (arity == 1) ts.head
-          else if (ctx.mode is Mode.Type) AppliedTypeTree(ref(tupleClass.typeRef), ts)
+          else if (ctx.mode is Mode.Type) AppliedTypeTree(ref(tupleTypeRef), ts)
           else if (arity == 0) unitLiteral
-          else Apply(ref(tupleClass.companionModule.valRef), ts)
+          else Apply(ref(tupleTypeRef.classSymbol.companionModule.valRef), ts)
         }
       case WhileDo(cond, body) =>
         // { <label> def while$(): Unit = if (cond) { body; while$() } ; while$() }
